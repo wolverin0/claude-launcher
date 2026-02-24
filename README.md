@@ -21,38 +21,45 @@ A single-file Python/tkinter app that:
 
 - **Bulk launch**: checkbox each project, then "Launch Selected" to reopen everything at once
 - **Select All / Select None**: quick bulk selection for the post-restart workflow
+- **Session preview**: shows the last user message so you know what you were working on
+- **Pin / favorites**: pin projects to always show at top (persisted across restarts)
+- **Session health**: **OK** = clean exit, **!!** = interrupted/crashed — know which sessions need attention
+- **Auto-start with Windows**: optional checkbox to launch automatically on boot
 - **`--continue`** mode: resume the most recent session (default)
 - **`-r` mode**: pick a specific session from a dropdown (sorted by recency)
 - **`--dangerously-skip-permissions`** toggle (on by default)
-- **Path validation**: green border = path exists, red = path missing (checkbox + button disabled)
+- **Path validation**: purple border = path exists, red = missing (disabled), gold = pinned
 - **Windows Terminal** support with cmd.exe fallback
 - Automatically clears the `CLAUDECODE` env var to avoid nested-session errors
 
 ## Screenshot
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Claude Code Session Launcher                         [Refresh]  │
-├──────────────────────────────────────────────────────────────────┤
-│  [x] --dangerously-skip-permissions                              │
-│  (o) --continue (last session)  ( ) -r (pick session)            │
-├──────────────────────────────────────────────────────────────────┤
-│  [Select All] [Select None]              [ Launch Selected (3) ] │
-├──────────────────────────────────────────────────────────────────┤
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ [x] impulsa                       [session ▼]    [Launch] │  │
-│  │     G:\_OneDrive\...\Py Apps\impulsa                      │  │
-│  │     Last: 2026-02-24 15:39  |  15 session(s)              │  │
-│  ├────────────────────────────────────────────────────────────┤  │
-│  │ [x] hospital                      [session ▼]    [Launch] │  │
-│  │     G:\_OneDrive\...\Py Apps\hospital                     │  │
-│  │     Last: 2026-02-24 19:54  |  5 session(s)               │  │
-│  ├────────────────────────────────────────────────────────────┤  │
-│  │ [x] pauol                         [session ▼]    [Launch] │  │
-│  │     C:\Users\pauol                                        │  │
-│  │     Last: 2026-02-24 19:54  |  33 session(s)              │  │
-│  └────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Claude Code Session Launcher                             [Refresh]  │
+├──────────────────────────────────────────────────────────────────────┤
+│  [x] --dangerously-skip-permissions                                  │
+│  (o) --continue    ( ) -r (pick)    [ ] Auto-start with Windows      │
+├──────────────────────────────────────────────────────────────────────┤
+│  [Select All] [Select None]  *=pinned OK=clean !!=int  [Launch (3)]  │
+├──────────────────────────────────────────────────────────────────────┤
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │ [x] * my-saas-app  OK                  [a1b2c3.. ▼] [Launch] │  │
+│  │       C:\Projects\my-saas-app                                 │  │
+│  │       "fix the payment webhook for sandbox mode..."           │  │
+│  │       Last: 2026-02-24 15:39  |  12 session(s)        [pin]  │  │
+│  ├────────────────────────────────────────────────────────────────┤  │
+│  │ [x]   backend-api  !!                  [d4e5f6.. ▼] [Launch] │  │
+│  │       D:\Work\backend-api                                     │  │
+│  │       "add rate limiting to the /auth endpoints..."           │  │
+│  │       Last: 2026-02-24 14:20  |  8 session(s)         [pin]  │  │
+│  ├────────────────────────────────────────────────────────────────┤  │
+│  │ [x]   landing-page  OK                [f7g8h9.. ▼] [Launch]  │  │
+│  │       C:\Projects\landing-page                                │  │
+│  │       "make the hero section responsive at 375px..."          │  │
+│  │       Last: 2026-02-24 12:05  |  3 session(s)         [pin]  │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Installation
