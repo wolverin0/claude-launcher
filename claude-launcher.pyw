@@ -239,12 +239,28 @@ def toggle_autostart(enable: bool):
             pass
 
 
-# Health indicator symbols and colors
-HEALTH_ICONS = {
-    'clean': ('', '#22c55e'),        # green circle
-    'interrupted': ('', '#f59e0b'),  # yellow warning
-    'unknown': ('', '#6b7280'),      # gray
-}
+# -- Color palette --
+BG = "#0f0e17"           # deep background
+SURFACE = "#1a1932"      # card / panel background
+SURFACE2 = "#232046"     # raised surface (options bar)
+BORDER = "#2e2b4a"       # subtle borders
+ACCENT = "#7f5af0"       # primary purple
+ACCENT_HOVER = "#6b46d6"
+GREEN = "#2cb67d"
+GREEN_HOVER = "#24a06d"
+GOLD = "#ffd369"
+RED = "#e53170"
+YELLOW = "#fbbf24"
+TEXT = "#fffffe"
+TEXT_DIM = "#94a1b2"
+TEXT_MUTED = "#72757e"
+PREVIEW = "#a78bfa"
+
+
+def _hover_btn(widget, normal_bg, hover_bg):
+    """Add hover effect to a button."""
+    widget.bind("<Enter>", lambda e: widget.config(bg=hover_bg))
+    widget.bind("<Leave>", lambda e: widget.config(bg=normal_bg))
 
 
 class SessionLauncher(tk.Tk):
@@ -252,9 +268,9 @@ class SessionLauncher(tk.Tk):
         super().__init__()
 
         self.title("Claude Code Session Launcher")
-        self.geometry("800x580")
-        self.minsize(680, 440)
-        self.configure(bg="#1a1a2e")
+        self.geometry("820x600")
+        self.minsize(700, 460)
+        self.configure(bg=BG)
 
         try:
             self.iconbitmap(default='')
@@ -270,6 +286,7 @@ class SessionLauncher(tk.Tk):
         self.project_data = {}
         self.project_dropdowns = {}
 
+        self._setup_styles()
         self._build_ui()
 
         self.update_idletasks()
@@ -277,83 +294,120 @@ class SessionLauncher(tk.Tk):
         y = (self.winfo_screenheight() // 2) - (self.winfo_reqheight() // 2)
         self.geometry(f"+{x}+{y}")
 
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TCombobox",
+                        fieldbackground=SURFACE2,
+                        background=SURFACE2,
+                        foreground=TEXT_DIM,
+                        selectbackground=ACCENT,
+                        arrowcolor=TEXT_DIM,
+                        borderwidth=0)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", SURFACE2)],
+                  selectbackground=[("readonly", ACCENT)],
+                  foreground=[("readonly", TEXT_DIM)])
+        # Remove focus highlight on combobox
+        self.option_add("*TCombobox*Listbox.background", SURFACE2)
+        self.option_add("*TCombobox*Listbox.foreground", TEXT_DIM)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", TEXT)
+
     def _build_ui(self):
-        # Header
-        header = tk.Frame(self, bg="#1a1a2e")
-        header.pack(fill="x", padx=15, pady=(15, 5))
+        # ── Header ──
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=20, pady=(18, 0))
 
-        tk.Label(header, text="Claude Code Session Launcher",
-                 bg="#1a1a2e", fg="#c4b5fd", font=("Segoe UI", 16, "bold")).pack(side="left")
+        tk.Label(header, text="\u2728", bg=BG, font=("Segoe UI", 18)).pack(side="left")
+        title_frame = tk.Frame(header, bg=BG)
+        title_frame.pack(side="left", padx=(8, 0))
+        tk.Label(title_frame, text="Claude Code Launcher",
+                 bg=BG, fg=TEXT, font=("Segoe UI", 17, "bold")).pack(anchor="w")
+        tk.Label(title_frame, text="Resume your sessions in one click",
+                 bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w")
 
-        refresh_btn = tk.Button(header, text="Refresh", bg="#2d3561", fg="#e0e0e0",
-                                font=("Segoe UI", 9), relief="flat", padx=10, pady=3,
-                                activebackground="#3d4571", cursor="hand2",
+        refresh_btn = tk.Button(header, text="\u21bb  Refresh", bg=SURFACE2, fg=TEXT_DIM,
+                                font=("Segoe UI", 9), relief="flat", padx=12, pady=5,
+                                activebackground=BORDER, cursor="hand2",
                                 command=self._refresh_projects)
-        refresh_btn.pack(side="right")
+        refresh_btn.pack(side="right", pady=(4, 0))
+        _hover_btn(refresh_btn, SURFACE2, BORDER)
 
-        # Options bar
-        opts = tk.Frame(self, bg="#16213e", highlightbackground="#2d3561", highlightthickness=1)
-        opts.pack(fill="x", padx=15, pady=8, ipady=6)
+        # ── Options panel ──
+        opts_outer = tk.Frame(self, bg=BORDER)
+        opts_outer.pack(fill="x", padx=20, pady=(12, 0), ipady=1)
+        opts = tk.Frame(opts_outer, bg=SURFACE)
+        opts.pack(fill="x", padx=1, pady=1, ipady=8)
 
-        tk.Checkbutton(opts, text="--dangerously-skip-permissions",
-                       variable=self.skip_perms, bg="#16213e", fg="#e0e0e0",
-                       selectcolor="#2d3561", activebackground="#16213e",
-                       activeforeground="#e0e0e0", font=("Consolas", 10)).pack(side="left", padx=(12, 20))
+        left_opts = tk.Frame(opts, bg=SURFACE)
+        left_opts.pack(side="left", padx=(14, 0))
 
-        tk.Radiobutton(opts, text="--continue", variable=self.mode, value="continue",
-                       bg="#16213e", fg="#e0e0e0", selectcolor="#2d3561",
-                       activebackground="#16213e", activeforeground="#e0e0e0",
-                       font=("Segoe UI", 10)).pack(side="left", padx=(0, 10))
+        tk.Checkbutton(left_opts, text="Skip permissions",
+                       variable=self.skip_perms, bg=SURFACE, fg=TEXT,
+                       selectcolor=ACCENT, activebackground=SURFACE,
+                       activeforeground=TEXT, font=("Segoe UI", 10),
+                       highlightthickness=0, bd=0).pack(side="left", padx=(0, 20))
 
-        tk.Radiobutton(opts, text="-r (pick)", variable=self.mode, value="resume",
-                       bg="#16213e", fg="#e0e0e0", selectcolor="#2d3561",
-                       activebackground="#16213e", activeforeground="#e0e0e0",
-                       font=("Segoe UI", 10)).pack(side="left", padx=(0, 15))
+        # Separator
+        tk.Frame(left_opts, bg=BORDER, width=1).pack(side="left", fill="y", padx=(0, 16), pady=2)
 
-        tk.Checkbutton(opts, text="Auto-start with Windows",
-                       variable=self.auto_start, bg="#16213e", fg="#94a3b8",
-                       selectcolor="#2d3561", activebackground="#16213e",
-                       activeforeground="#94a3b8", font=("Segoe UI", 9)).pack(side="right", padx=(0, 12))
+        tk.Radiobutton(left_opts, text="--continue", variable=self.mode, value="continue",
+                       bg=SURFACE, fg=TEXT, selectcolor=ACCENT,
+                       activebackground=SURFACE, activeforeground=TEXT,
+                       font=("Segoe UI", 10), highlightthickness=0, bd=0).pack(side="left", padx=(0, 8))
 
-        # Bulk actions bar
-        bulk = tk.Frame(self, bg="#1a1a2e")
-        bulk.pack(fill="x", padx=15, pady=(0, 5))
+        tk.Radiobutton(left_opts, text="-r (pick session)", variable=self.mode, value="resume",
+                       bg=SURFACE, fg=TEXT, selectcolor=ACCENT,
+                       activebackground=SURFACE, activeforeground=TEXT,
+                       font=("Segoe UI", 10), highlightthickness=0, bd=0).pack(side="left")
 
-        tk.Button(bulk, text="Select All", bg="#2d3561", fg="#e0e0e0",
-                  font=("Segoe UI", 9), relief="flat", padx=8, pady=2,
-                  activebackground="#3d4571", cursor="hand2",
-                  command=self._select_all).pack(side="left", padx=(0, 5))
+        tk.Checkbutton(opts, text="Auto-start",
+                       variable=self.auto_start, bg=SURFACE, fg=TEXT_MUTED,
+                       selectcolor=ACCENT, activebackground=SURFACE,
+                       activeforeground=TEXT_MUTED, font=("Segoe UI", 9),
+                       highlightthickness=0, bd=0).pack(side="right", padx=(0, 14))
 
-        tk.Button(bulk, text="Select None", bg="#2d3561", fg="#e0e0e0",
-                  font=("Segoe UI", 9), relief="flat", padx=8, pady=2,
-                  activebackground="#3d4571", cursor="hand2",
-                  command=self._select_none).pack(side="left", padx=(0, 15))
+        # ── Toolbar ──
+        toolbar = tk.Frame(self, bg=BG)
+        toolbar.pack(fill="x", padx=20, pady=(10, 6))
 
-        # Legend
-        legend = tk.Frame(bulk, bg="#1a1a2e")
-        legend.pack(side="left", padx=(10, 0))
-        tk.Label(legend, text="*", bg="#1a1a2e", fg="#fbbf24", font=("Segoe UI", 10)).pack(side="left")
-        tk.Label(legend, text="=pinned", bg="#1a1a2e", fg="#64748b", font=("Segoe UI", 8)).pack(side="left", padx=(0, 8))
-        tk.Label(legend, text="OK", bg="#1a1a2e", fg="#22c55e", font=("Segoe UI", 8, "bold")).pack(side="left")
-        tk.Label(legend, text="=clean", bg="#1a1a2e", fg="#64748b", font=("Segoe UI", 8)).pack(side="left", padx=(0, 8))
-        tk.Label(legend, text="!!", bg="#1a1a2e", fg="#f59e0b", font=("Segoe UI", 8, "bold")).pack(side="left")
-        tk.Label(legend, text="=interrupted", bg="#1a1a2e", fg="#64748b", font=("Segoe UI", 8)).pack(side="left")
+        sel_all = tk.Button(toolbar, text="Select All", bg=SURFACE2, fg=TEXT_DIM,
+                            font=("Segoe UI", 9), relief="flat", padx=10, pady=4,
+                            activebackground=BORDER, cursor="hand2",
+                            command=self._select_all)
+        sel_all.pack(side="left", padx=(0, 4))
+        _hover_btn(sel_all, SURFACE2, BORDER)
+
+        sel_none = tk.Button(toolbar, text="Deselect", bg=SURFACE2, fg=TEXT_DIM,
+                             font=("Segoe UI", 9), relief="flat", padx=10, pady=4,
+                             activebackground=BORDER, cursor="hand2",
+                             command=self._select_none)
+        sel_none.pack(side="left", padx=(0, 12))
+        _hover_btn(sel_none, SURFACE2, BORDER)
+
+        # Compact legend
+        legend = tk.Frame(toolbar, bg=BG)
+        legend.pack(side="left", padx=(6, 0))
+        for sym, color, label in [("\u2605", GOLD, "pinned"), ("\u2713", GREEN, "clean"), ("\u26a0", YELLOW, "interrupted")]:
+            tk.Label(legend, text=sym, bg=BG, fg=color, font=("Segoe UI", 9)).pack(side="left")
+            tk.Label(legend, text=label, bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(1, 8))
 
         self.bulk_launch_btn = tk.Button(
-            bulk, text="  Launch Selected (0)  ", bg="#059669", fg="white",
-            font=("Segoe UI", 11, "bold"), relief="flat", padx=18, pady=5,
-            activebackground="#047857", cursor="hand2",
+            toolbar, text="  Launch Selected (0)  ", bg="#4a4a4a", fg=TEXT,
+            font=("Segoe UI", 10, "bold"), relief="flat", padx=20, pady=5,
+            activebackground=GREEN_HOVER, cursor="hand2", state="disabled",
             command=self._launch_selected)
         self.bulk_launch_btn.pack(side="right")
 
-        # Scrollable project list
-        container = tk.Frame(self, bg="#1a1a2e")
-        container.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        # ── Scrollable project list ──
+        container = tk.Frame(self, bg=BG)
+        container.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
-        self.canvas = tk.Canvas(container, bg="#1a1a2e", highlightthickness=0)
+        self.canvas = tk.Canvas(container, bg=BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(container, orient="vertical", command=self.canvas.yview,
-                                 bg="#2d3561", troughcolor="#1a1a2e")
-        self.scrollable = tk.Frame(self.canvas, bg="#1a1a2e")
+                                 bg=SURFACE2, troughcolor=BG, width=8)
+        self.scrollable = tk.Frame(self.canvas, bg=BG)
 
         self.scrollable.bind("<Configure>",
                              lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
@@ -385,7 +439,6 @@ class SessionLauncher(tk.Tk):
             pinned.add(encoded_name)
         self.config_data["pinned"] = list(pinned)
         save_config(self.config_data)
-        # Re-render from cached data (don't re-scan files — that updates timestamps)
         self._rerender_projects()
 
     def _update_bulk_count(self, *_args):
@@ -394,9 +447,10 @@ class SessionLauncher(tk.Tk):
                         self._key_for_var(v), {}).get('decoded_path', '')))
         self.bulk_launch_btn.config(text=f"  Launch Selected ({count})  ")
         if count > 0:
-            self.bulk_launch_btn.config(bg="#059669", state="normal", cursor="hand2")
+            self.bulk_launch_btn.config(bg=GREEN, state="normal", cursor="hand2")
+            _hover_btn(self.bulk_launch_btn, GREEN, GREEN_HOVER)
         else:
-            self.bulk_launch_btn.config(bg="#6b7280", state="disabled", cursor="arrow")
+            self.bulk_launch_btn.config(bg="#4a4a4a", state="disabled", cursor="arrow")
 
     def _key_for_var(self, var):
         for k, v in self.project_checks.items():
@@ -438,13 +492,11 @@ class SessionLauncher(tk.Tk):
             launch_session(proj['decoded_path'], skip, mode, session_id)
 
     def _refresh_projects(self):
-        """Full re-scan from disk (Refresh button)."""
         _path_cache.clear()
         self._cached_projects = get_projects()
         self._render_project_list()
 
     def _rerender_projects(self):
-        """Re-sort and redraw using cached data (pin/unpin toggle)."""
         if not hasattr(self, '_cached_projects') or not self._cached_projects:
             self._refresh_projects()
             return
@@ -460,7 +512,6 @@ class SessionLauncher(tk.Tk):
         self._render_project_list()
 
     def _render_project_list(self):
-        """Render project cards from self._cached_projects."""
         for widget in self.scrollable.winfo_children():
             widget.destroy()
 
@@ -470,7 +521,7 @@ class SessionLauncher(tk.Tk):
 
         if not self._cached_projects:
             tk.Label(self.scrollable, text="No projects found in ~/.claude/projects/",
-                     bg="#1a1a2e", fg="#94a3b8", font=("Segoe UI", 12)).pack(pady=30)
+                     bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 12)).pack(pady=40)
             return
 
         for proj in self._cached_projects:
@@ -483,90 +534,94 @@ class SessionLauncher(tk.Tk):
         path_exists = os.path.isdir(proj['decoded_path'])
         is_pinned = proj.get('pinned', False)
 
-        if is_pinned:
-            border_color = "#fbbf24"  # gold for pinned
-        elif path_exists:
-            border_color = "#7c3aed"
-        else:
-            border_color = "#dc2626"
-
         self.project_data[key] = proj
 
-        card = tk.Frame(self.scrollable, bg="#16213e",
-                        highlightbackground=border_color, highlightthickness=1)
-        card.pack(fill="x", pady=3, ipady=5)
+        # Card with left accent stripe
+        card_outer = tk.Frame(self.scrollable, bg=BG)
+        card_outer.pack(fill="x", pady=3)
 
-        # Left: checkbox + info
-        left = tk.Frame(card, bg="#16213e")
-        left.pack(side="left", fill="x", expand=True, padx=4, pady=3)
+        # Left color stripe
+        stripe_color = GOLD if is_pinned else (ACCENT if path_exists else RED)
+        stripe = tk.Frame(card_outer, bg=stripe_color, width=4)
+        stripe.pack(side="left", fill="y")
+        stripe.pack_propagate(False)
+
+        card = tk.Frame(card_outer, bg=SURFACE)
+        card.pack(side="left", fill="x", expand=True, ipady=8)
+
+        # ── Left: checkbox + info ──
+        left = tk.Frame(card, bg=SURFACE)
+        left.pack(side="left", fill="x", expand=True, padx=(8, 4), pady=2)
 
         check_var = tk.BooleanVar(value=False)
         check_var.trace_add("write", self._update_bulk_count)
         self.project_checks[key] = check_var
 
-        cb = tk.Checkbutton(left, variable=check_var, bg="#16213e", fg="white",
-                            selectcolor="#7c3aed", activebackground="#16213e",
-                            indicatoron=True,
+        cb = tk.Checkbutton(left, variable=check_var, bg=SURFACE, fg=TEXT,
+                            selectcolor=ACCENT, activebackground=SURFACE,
+                            highlightthickness=0, bd=0,
                             state="normal" if path_exists else "disabled")
         cb.pack(side="left", padx=(4, 0))
 
-        info = tk.Frame(left, bg="#16213e")
-        info.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        info = tk.Frame(left, bg=SURFACE)
+        info.pack(side="left", fill="x", expand=True, padx=(6, 0))
 
-        # Name row with pin button and health indicator
-        name_row = tk.Frame(info, bg="#16213e")
+        # Name row
+        name_row = tk.Frame(info, bg=SURFACE)
         name_row.pack(fill="x")
 
         name = Path(proj['decoded_path']).name or proj['encoded_name']
-        pin_text = "* " if is_pinned else ""
-        pin_color = "#fbbf24" if is_pinned else "#c4b5fd"
 
         if is_pinned:
-            tk.Label(name_row, text="*", bg="#16213e", fg="#fbbf24",
-                     font=("Segoe UI", 14, "bold")).pack(side="left")
+            tk.Label(name_row, text="\u2605 ", bg=SURFACE, fg=GOLD,
+                     font=("Segoe UI", 12)).pack(side="left")
 
-        tk.Label(name_row, text=name, bg="#16213e", fg="#c4b5fd",
+        tk.Label(name_row, text=name, bg=SURFACE, fg=TEXT,
                  font=("Segoe UI", 12, "bold"), anchor="w").pack(side="left")
 
-        # Health indicator
+        # Health badge
         health = proj.get('health', 'unknown')
         if health == 'clean':
-            tk.Label(name_row, text=" OK", bg="#16213e", fg="#22c55e",
-                     font=("Segoe UI", 9, "bold")).pack(side="left", padx=(6, 0))
+            badge = tk.Label(name_row, text=" \u2713 clean ", bg="#1a3a2a", fg=GREEN,
+                             font=("Segoe UI", 8, "bold"))
+            badge.pack(side="left", padx=(8, 0))
         elif health == 'interrupted':
-            tk.Label(name_row, text=" !!", bg="#16213e", fg="#f59e0b",
-                     font=("Segoe UI", 9, "bold")).pack(side="left", padx=(6, 0))
+            badge = tk.Label(name_row, text=" \u26a0 interrupted ", bg="#3a2a1a", fg=YELLOW,
+                             font=("Segoe UI", 8, "bold"))
+            badge.pack(side="left", padx=(8, 0))
 
-        # Pin toggle button
-        pin_btn = tk.Button(name_row, text="unpin" if is_pinned else "pin",
-                            bg="#16213e", fg="#94a3b8", font=("Segoe UI", 8),
-                            relief="flat", padx=4, pady=0, bd=0,
-                            activebackground="#16213e", activeforeground="#c4b5fd",
+        # Pin toggle
+        pin_text = "\u2605 unpin" if is_pinned else "\u2606 pin"
+        pin_btn = tk.Button(name_row, text=pin_text,
+                            bg=SURFACE, fg=TEXT_MUTED, font=("Segoe UI", 8),
+                            relief="flat", padx=6, pady=0, bd=0,
+                            activebackground=SURFACE, activeforeground=ACCENT,
                             cursor="hand2",
                             command=lambda k=key: self._toggle_pin(k))
-        pin_btn.pack(side="left", padx=(8, 0))
+        pin_btn.pack(side="left", padx=(10, 0))
 
         # Path
-        path_color = "#94a3b8" if path_exists else "#ef4444"
-        tk.Label(info, text=proj['decoded_path'], bg="#16213e", fg=path_color,
-                 font=("Consolas", 9), anchor="w").pack(fill="x")
+        path_color = TEXT_DIM if path_exists else RED
+        tk.Label(info, text=proj['decoded_path'], bg=SURFACE, fg=path_color,
+                 font=("Consolas", 9), anchor="w").pack(fill="x", pady=(2, 0))
 
-        # Session preview (last user message)
+        # Session preview
         preview = proj.get('preview', '')
         if preview:
-            tk.Label(info, text=f'"{preview}"', bg="#16213e", fg="#8b5cf6",
-                     font=("Segoe UI", 9, "italic"), anchor="w").pack(fill="x")
+            tk.Label(info, text=f'\u201c{preview}\u201d', bg=SURFACE, fg=PREVIEW,
+                     font=("Segoe UI", 9, "italic"), anchor="w", wraplength=450,
+                     justify="left").pack(fill="x", pady=(1, 0))
 
-        # Metadata line
+        # Metadata
         if proj['last_active']:
-            time_str = proj['last_active'].strftime("%Y-%m-%d %H:%M")
+            time_str = proj['last_active'].strftime("%b %d, %H:%M")
             n = len(proj['sessions'])
-            tk.Label(info, text=f"Last: {time_str}  |  {n} session(s)",
-                     bg="#16213e", fg="#64748b", font=("Segoe UI", 8), anchor="w").pack(fill="x")
+            tk.Label(info, text=f"{time_str}  \u00b7  {n} session{'s' if n != 1 else ''}",
+                     bg=SURFACE, fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w").pack(fill="x", pady=(2, 0))
 
-        # Right side: session dropdown + launch button
-        right = tk.Frame(card, bg="#16213e")
-        right.pack(side="right", padx=12, pady=4)
+        # ── Right: dropdown + launch ──
+        right = tk.Frame(card, bg=SURFACE)
+        right.pack(side="right", padx=(4, 12), pady=6)
 
         session_ids = [s['id'] for s in proj['sessions'][:15]]
         dropdown = None
@@ -574,14 +629,14 @@ class SessionLauncher(tk.Tk):
         if proj['sessions']:
             session_labels = []
             for s in proj['sessions'][:15]:
-                health_mark = "!" if s.get('health') == 'interrupted' else ""
-                label = f"{health_mark}{s['id'][:8]}.. {s['modified'].strftime('%m/%d %H:%M')}"
+                mark = "\u26a0" if s.get('health') == 'interrupted' else ""
+                label = f"{mark}{s['id'][:8]}.. {s['modified'].strftime('%m/%d %H:%M')}"
                 session_labels.append(label)
 
             session_var = tk.StringVar(value=session_labels[0] if session_labels else "")
             dropdown = ttk.Combobox(right, textvariable=session_var,
-                                    values=session_labels, width=22, state="readonly")
-            dropdown.pack(pady=(0, 5))
+                                    values=session_labels, width=20, state="readonly")
+            dropdown.pack(pady=(0, 6))
             self.project_dropdowns[key] = dropdown
 
         def on_launch(p=proj, d=dropdown, sids=session_ids):
@@ -592,13 +647,15 @@ class SessionLauncher(tk.Tk):
                 session_id = sids[idx]
             launch_session(p['decoded_path'], self.skip_perms.get(), mode, session_id)
 
-        btn_bg = "#7c3aed" if path_exists else "#6b7280"
-        launch_btn = tk.Button(right, text="  Launch  ", bg=btn_bg, fg="white",
-                               font=("Segoe UI", 11, "bold"), relief="flat", padx=18, pady=6,
-                               activebackground="#6d28d9", cursor="hand2", command=on_launch)
+        btn_bg = ACCENT if path_exists else "#4a4a4a"
+        launch_btn = tk.Button(right, text="  Launch  ", bg=btn_bg, fg=TEXT,
+                               font=("Segoe UI", 10, "bold"), relief="flat", padx=20, pady=6,
+                               activebackground=ACCENT_HOVER, cursor="hand2", command=on_launch)
         launch_btn.pack()
 
-        if not path_exists:
+        if path_exists:
+            _hover_btn(launch_btn, ACCENT, ACCENT_HOVER)
+        else:
             launch_btn.config(state="disabled", cursor="arrow")
 
 

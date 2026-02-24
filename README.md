@@ -34,33 +34,7 @@ A single-file Python/tkinter app that:
 
 ## Screenshot
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Claude Code Session Launcher                             [Refresh]  │
-├──────────────────────────────────────────────────────────────────────┤
-│  [x] --dangerously-skip-permissions                                  │
-│  (o) --continue    ( ) -r (pick)    [ ] Auto-start with Windows      │
-├──────────────────────────────────────────────────────────────────────┤
-│  [Select All] [Select None]  *=pinned OK=clean !!=int  [Launch (3)]  │
-├──────────────────────────────────────────────────────────────────────┤
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │ [x] * my-saas-app  OK                  [a1b2c3.. ▼] [Launch] │  │
-│  │       C:\Projects\my-saas-app                                 │  │
-│  │       "fix the payment webhook for sandbox mode..."           │  │
-│  │       Last: 2026-02-24 15:39  |  12 session(s)        [pin]  │  │
-│  ├────────────────────────────────────────────────────────────────┤  │
-│  │ [x]   backend-api  !!                  [d4e5f6.. ▼] [Launch] │  │
-│  │       D:\Work\backend-api                                     │  │
-│  │       "add rate limiting to the /auth endpoints..."           │  │
-│  │       Last: 2026-02-24 14:20  |  8 session(s)         [pin]  │  │
-│  ├────────────────────────────────────────────────────────────────┤  │
-│  │ [x]   landing-page  OK                [f7g8h9.. ▼] [Launch]  │  │
-│  │       C:\Projects\landing-page                                │  │
-│  │       "make the hero section responsive at 375px..."          │  │
-│  │       Last: 2026-02-24 12:05  |  3 session(s)         [pin]  │  │
-│  └────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
-```
+![Claude Code Session Launcher](screenshot.png)
 
 ## Installation
 
