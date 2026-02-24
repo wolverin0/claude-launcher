@@ -19,32 +19,40 @@ A single-file Python/tkinter app that:
 
 ### Features
 
+- **Bulk launch**: checkbox each project, then "Launch Selected" to reopen everything at once
+- **Select All / Select None**: quick bulk selection for the post-restart workflow
 - **`--continue`** mode: resume the most recent session (default)
 - **`-r` mode**: pick a specific session from a dropdown (sorted by recency)
 - **`--dangerously-skip-permissions`** toggle (on by default)
-- **Path validation**: green border = path exists, red = path missing (button disabled)
+- **Path validation**: green border = path exists, red = path missing (checkbox + button disabled)
 - **Windows Terminal** support with cmd.exe fallback
 - Automatically clears the `CLAUDECODE` env var to avoid nested-session errors
 
 ## Screenshot
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Claude Code Session Launcher                    [Refresh]  │
-├─────────────────────────────────────────────────────────────┤
-│  [x] --dangerously-skip-permissions                         │
-│  (o) --continue (last session)  ( ) -r (pick session)       │
-├─────────────────────────────────────────────────────────────┤
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ impulsa                          [session ▼] [Launch] │  │
-│  │ G:\_OneDrive\...\Py Apps\impulsa                      │  │
-│  │ Last: 2026-02-24 15:39  |  15 session(s)              │  │
-│  ├───────────────────────────────────────────────────────┤  │
-│  │ hospital                         [session ▼] [Launch] │  │
-│  │ G:\_OneDrive\...\Py Apps\hospital                     │  │
-│  │ Last: 2026-02-24 19:54  |  5 session(s)               │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Claude Code Session Launcher                         [Refresh]  │
+├──────────────────────────────────────────────────────────────────┤
+│  [x] --dangerously-skip-permissions                              │
+│  (o) --continue (last session)  ( ) -r (pick session)            │
+├──────────────────────────────────────────────────────────────────┤
+│  [Select All] [Select None]              [ Launch Selected (3) ] │
+├──────────────────────────────────────────────────────────────────┤
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ [x] impulsa                       [session ▼]    [Launch] │  │
+│  │     G:\_OneDrive\...\Py Apps\impulsa                      │  │
+│  │     Last: 2026-02-24 15:39  |  15 session(s)              │  │
+│  ├────────────────────────────────────────────────────────────┤  │
+│  │ [x] hospital                      [session ▼]    [Launch] │  │
+│  │     G:\_OneDrive\...\Py Apps\hospital                     │  │
+│  │     Last: 2026-02-24 19:54  |  5 session(s)               │  │
+│  ├────────────────────────────────────────────────────────────┤  │
+│  │ [x] pauol                         [session ▼]    [Launch] │  │
+│  │     C:\Users\pauol                                        │  │
+│  │     Last: 2026-02-24 19:54  |  33 session(s)              │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Installation
@@ -57,7 +65,7 @@ A single-file Python/tkinter app that:
 ### Setup
 
 ```bash
-git clone https://github.com/pauoliveras/claude-launcher.git
+git clone https://github.com/wolverin0/claude-launcher.git
 cd claude-launcher
 ```
 

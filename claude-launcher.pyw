@@ -126,11 +126,10 @@ class SessionLauncher(tk.Tk):
         super().__init__()
 
         self.title("Claude Code Session Launcher")
-        self.geometry("750x520")
-        self.minsize(600, 400)
+        self.geometry("780x560")
+        self.minsize(650, 420)
         self.configure(bg="#1a1a2e")
 
-        # Icon (optional, skip if not available)
         try:
             self.iconbitmap(default='')
         except Exception:
@@ -138,6 +137,9 @@ class SessionLauncher(tk.Tk):
 
         self.skip_perms = tk.BooleanVar(value=True)
         self.mode = tk.StringVar(value="continue")
+        self.project_checks = {}  # encoded_name -> BooleanVar
+        self.project_data = {}    # encoded_name -> proj dict
+        self.project_dropdowns = {}  # encoded_name -> dropdown widget
 
         self._build_ui()
 
@@ -180,6 +182,29 @@ class SessionLauncher(tk.Tk):
                        activebackground="#16213e", activeforeground="#e0e0e0",
                        font=("Segoe UI", 10)).pack(side="left")
 
+        # Bulk actions bar
+        bulk = tk.Frame(self, bg="#1a1a2e")
+        bulk.pack(fill="x", padx=15, pady=(0, 5))
+
+        select_all_btn = tk.Button(bulk, text="Select All", bg="#2d3561", fg="#e0e0e0",
+                                   font=("Segoe UI", 9), relief="flat", padx=8, pady=2,
+                                   activebackground="#3d4571", cursor="hand2",
+                                   command=self._select_all)
+        select_all_btn.pack(side="left", padx=(0, 5))
+
+        select_none_btn = tk.Button(bulk, text="Select None", bg="#2d3561", fg="#e0e0e0",
+                                    font=("Segoe UI", 9), relief="flat", padx=8, pady=2,
+                                    activebackground="#3d4571", cursor="hand2",
+                                    command=self._select_none)
+        select_none_btn.pack(side="left", padx=(0, 15))
+
+        self.bulk_launch_btn = tk.Button(
+            bulk, text="  Launch Selected (0)  ", bg="#059669", fg="white",
+            font=("Segoe UI", 11, "bold"), relief="flat", padx=18, pady=5,
+            activebackground="#047857", cursor="hand2",
+            command=self._launch_selected)
+        self.bulk_launch_btn.pack(side="right")
+
         # Scrollable project list
         container = tk.Frame(self, bg="#1a1a2e")
         container.pack(fill="both", expand=True, padx=15, pady=(0, 15))
@@ -194,22 +219,73 @@ class SessionLauncher(tk.Tk):
         self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable, anchor="nw")
         self.canvas.configure(yscrollcommand=scrollbar.set)
 
-        # Make scrollable frame expand to canvas width
         self.canvas.bind("<Configure>",
                          lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width))
 
         self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Mouse wheel
         self.bind_all("<MouseWheel>",
                       lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
 
         self._refresh_projects()
 
+    def _update_bulk_count(self, *_args):
+        count = sum(1 for v in self.project_checks.values()
+                    if v.get() and os.path.isdir(self.project_data.get(
+                        self._key_for_var(v), {}).get('decoded_path', '')))
+        self.bulk_launch_btn.config(text=f"  Launch Selected ({count})  ")
+        if count > 0:
+            self.bulk_launch_btn.config(bg="#059669", state="normal", cursor="hand2")
+        else:
+            self.bulk_launch_btn.config(bg="#6b7280", state="disabled", cursor="arrow")
+
+    def _key_for_var(self, var):
+        for k, v in self.project_checks.items():
+            if v is var:
+                return k
+        return ""
+
+    def _select_all(self):
+        for key, var in self.project_checks.items():
+            proj = self.project_data.get(key, {})
+            if os.path.isdir(proj.get('decoded_path', '')):
+                var.set(True)
+        self._update_bulk_count()
+
+    def _select_none(self):
+        for var in self.project_checks.values():
+            var.set(False)
+        self._update_bulk_count()
+
+    def _launch_selected(self):
+        mode = self.mode.get()
+        skip = self.skip_perms.get()
+
+        for key, var in self.project_checks.items():
+            if not var.get():
+                continue
+            proj = self.project_data.get(key)
+            if not proj or not os.path.isdir(proj['decoded_path']):
+                continue
+
+            session_id = None
+            if mode == "resume":
+                dropdown = self.project_dropdowns.get(key)
+                sids = [s['id'] for s in proj['sessions'][:15]]
+                if dropdown and sids:
+                    idx = dropdown.current() if dropdown.current() >= 0 else 0
+                    session_id = sids[idx]
+
+            launch_session(proj['decoded_path'], skip, mode, session_id)
+
     def _refresh_projects(self):
         for widget in self.scrollable.winfo_children():
             widget.destroy()
+
+        self.project_checks.clear()
+        self.project_data.clear()
+        self.project_dropdowns.clear()
 
         projects = get_projects()
 
@@ -221,17 +297,34 @@ class SessionLauncher(tk.Tk):
         for proj in projects:
             self._add_project_card(proj)
 
+        self._update_bulk_count()
+
     def _add_project_card(self, proj):
+        key = proj['encoded_name']
         path_exists = os.path.isdir(proj['decoded_path'])
         border_color = "#7c3aed" if path_exists else "#dc2626"
+
+        self.project_data[key] = proj
 
         card = tk.Frame(self.scrollable, bg="#16213e",
                         highlightbackground=border_color, highlightthickness=1)
         card.pack(fill="x", pady=4, ipady=6)
 
-        # Left: info
-        info = tk.Frame(card, bg="#16213e")
-        info.pack(side="left", fill="x", expand=True, padx=12, pady=4)
+        # Left: checkbox + info
+        left = tk.Frame(card, bg="#16213e")
+        left.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+
+        check_var = tk.BooleanVar(value=False)
+        check_var.trace_add("write", self._update_bulk_count)
+        self.project_checks[key] = check_var
+
+        cb = tk.Checkbutton(left, variable=check_var, bg="#16213e",
+                            selectcolor="#2d3561", activebackground="#16213e",
+                            state="normal" if path_exists else "disabled")
+        cb.pack(side="left", padx=(4, 0))
+
+        info = tk.Frame(left, bg="#16213e")
+        info.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         name = Path(proj['decoded_path']).name or proj['encoded_name']
         tk.Label(info, text=name, bg="#16213e", fg="#c4b5fd",
@@ -265,6 +358,7 @@ class SessionLauncher(tk.Tk):
             dropdown = ttk.Combobox(right, textvariable=session_var,
                                     values=session_labels, width=22, state="readonly")
             dropdown.pack(pady=(0, 5))
+            self.project_dropdowns[key] = dropdown
 
         # Launch button
         def on_launch(p=proj, d=dropdown, sids=session_ids):
