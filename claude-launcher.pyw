@@ -385,7 +385,8 @@ class SessionLauncher(tk.Tk):
             pinned.add(encoded_name)
         self.config_data["pinned"] = list(pinned)
         save_config(self.config_data)
-        self._refresh_projects()
+        # Re-render from cached data (don't re-scan files — that updates timestamps)
+        self._rerender_projects()
 
     def _update_bulk_count(self, *_args):
         count = sum(1 for v in self.project_checks.values()
@@ -437,6 +438,29 @@ class SessionLauncher(tk.Tk):
             launch_session(proj['decoded_path'], skip, mode, session_id)
 
     def _refresh_projects(self):
+        """Full re-scan from disk (Refresh button)."""
+        _path_cache.clear()
+        self._cached_projects = get_projects()
+        self._render_project_list()
+
+    def _rerender_projects(self):
+        """Re-sort and redraw using cached data (pin/unpin toggle)."""
+        if not hasattr(self, '_cached_projects') or not self._cached_projects:
+            self._refresh_projects()
+            return
+
+        pinned = set(self.config_data.get("pinned", []))
+        for proj in self._cached_projects:
+            proj['pinned'] = proj['encoded_name'] in pinned
+
+        self._cached_projects.sort(key=lambda p: (
+            0 if p['pinned'] else 1,
+            -(p['last_active'].timestamp() if p['last_active'] else 0)
+        ))
+        self._render_project_list()
+
+    def _render_project_list(self):
+        """Render project cards from self._cached_projects."""
         for widget in self.scrollable.winfo_children():
             widget.destroy()
 
@@ -444,14 +468,12 @@ class SessionLauncher(tk.Tk):
         self.project_data.clear()
         self.project_dropdowns.clear()
 
-        projects = get_projects()
-
-        if not projects:
+        if not self._cached_projects:
             tk.Label(self.scrollable, text="No projects found in ~/.claude/projects/",
                      bg="#1a1a2e", fg="#94a3b8", font=("Segoe UI", 12)).pack(pady=30)
             return
 
-        for proj in projects:
+        for proj in self._cached_projects:
             self._add_project_card(proj)
 
         self._update_bulk_count()
