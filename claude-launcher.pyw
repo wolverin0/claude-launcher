@@ -6,12 +6,13 @@ import sys
 import subprocess
 import json
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from datetime import datetime, timedelta
 import threading
 import time
 import platform
+import shutil
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CONFIG_FILE = Path.home() / ".claude" / "launcher-config.json"
@@ -30,7 +31,8 @@ def load_config() -> dict:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return {"pinned": [], "auto_start": False, "hidden": [], "sort": "recent",
-                "compact": False, "notes": {}, "custom_flags": {}}
+                "compact": False, "notes": {}, "custom_flags": {},
+                "geometry": "", "launch_history": {}, "last_seen": {}}
 
 
 def save_config(config: dict):
@@ -95,6 +97,31 @@ def _session_size_label(sessions):
         return "med"
     else:
         return "large"
+
+
+def _token_estimate(size_bytes):
+    """Rough token estimate from JSONL size (~6 bytes per token with JSON overhead)."""
+    tokens = size_bytes // 6
+    if tokens < 1000:
+        return f"{tokens}t"
+    elif tokens < 1_000_000:
+        return f"{tokens // 1000}k"
+    else:
+        return f"{tokens / 1_000_000:.1f}M"
+
+
+def _duration_str(seconds):
+    """Format seconds to human-readable duration."""
+    if seconds < 60:
+        return "<1m"
+    elif seconds < 3600:
+        return f"{int(seconds / 60)}m"
+    elif seconds < 86400:
+        h = int(seconds / 3600)
+        m = int((seconds % 3600) / 60)
+        return f"{h}h{m}m" if m else f"{h}h"
+    else:
+        return f"{int(seconds / 86400)}d"
 
 
 def get_real_path(project_dir: Path, encoded_name: str) -> str:
@@ -241,10 +268,13 @@ def get_sessions(project_dir: Path) -> list:
     for f in project_dir.glob("*.jsonl"):
         try:
             stat = f.stat()
+            duration = max(0, stat.st_mtime - stat.st_ctime)
             sessions.append({
                 'id': f.stem, 'file': f,
                 'modified': datetime.fromtimestamp(stat.st_mtime),
+                'created': datetime.fromtimestamp(stat.st_ctime),
                 'size': stat.st_size,
+                'duration': duration,
                 'preview': get_session_preview(f),
                 'health': get_session_health(f),
             })
@@ -351,6 +381,7 @@ TEXT = "#fffffe"
 TEXT_DIM = "#94a1b2"
 TEXT_MUTED = "#72757e"
 PREVIEW = "#a78bfa"
+CYAN = "#22d3ee"
 
 
 def _hover_btn(widget, normal_bg, hover_bg):
@@ -362,7 +393,7 @@ class SessionLauncher(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Claude Code Session Launcher")
-        self.geometry("850x620")
+        self.geometry("850x650")
         self.minsize(700, 460)
         self.configure(bg=BG)
         try:
@@ -377,12 +408,17 @@ class SessionLauncher(tk.Tk):
         self.auto_start.trace_add("write", self._on_autostart_toggle)
         self.compact_mode = tk.BooleanVar(value=self.config_data.get("compact", False))
         self.compact_mode.trace_add("write", self._on_compact_toggle)
+        self.always_on_top = tk.BooleanVar(value=False)
+        self.always_on_top.trace_add("write", self._on_topmost_toggle)
         self.project_checks = {}
         self.project_data = {}
         self.project_dropdowns = {}
         self._card_frames = {}
         self._card_order = []
+        self._card_widgets = {}
         self._last_checked_key = None
+        self._focused_idx = -1
+        self._last_refresh = None
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_change)
@@ -395,10 +431,15 @@ class SessionLauncher(tk.Tk):
         self._setup_styles()
         self._build_ui()
 
-        self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - (self.winfo_reqwidth() // 2)
-        y = (self.winfo_screenheight() // 2) - (self.winfo_reqheight() // 2)
-        self.geometry(f"+{x}+{y}")
+        # Restore window geometry
+        saved_geo = self.config_data.get("geometry", "")
+        if saved_geo:
+            try:
+                self.geometry(saved_geo)
+            except Exception:
+                self._center_window()
+        else:
+            self._center_window()
 
         # Keyboard shortcuts
         self.bind("<Control-a>", lambda e: self._select_all())
@@ -412,9 +453,20 @@ class SessionLauncher(tk.Tk):
         self.bind("<Control-p>", lambda e: self._show_command_palette())
         self.bind("<Control-P>", lambda e: self._show_command_palette())
         self.bind("<Control-e>", lambda e: self._export_config())
-        self.bind("<Control-i>", lambda e: self._import_config())
+        self.bind("<Control-g>", lambda e: self._show_session_search())
+        self.bind("<Control-G>", lambda e: self._show_session_search())
+        self.bind("<Down>", self._on_arrow_down)
+        self.bind("<Up>", self._on_arrow_up)
+        self.bind("<space>", self._on_space_key)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._start_file_watcher()
+        self._update_last_seen()
+
+    def _center_window(self):
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - (self.winfo_reqwidth() // 2)
+        y = (self.winfo_screenheight() // 2) - (self.winfo_reqheight() // 2)
+        self.geometry(f"+{x}+{y}")
 
     def _setup_styles(self):
         style = ttk.Style()
@@ -484,6 +536,10 @@ class SessionLauncher(tk.Tk):
                        bg=SURFACE, fg=TEXT_MUTED, selectcolor=ACCENT, activebackground=SURFACE,
                        activeforeground=TEXT_MUTED, font=("Segoe UI", 9),
                        highlightthickness=0, bd=0).pack(side="right")
+        tk.Checkbutton(right_opts, text="On Top", variable=self.always_on_top,
+                       bg=SURFACE, fg=TEXT_MUTED, selectcolor=ACCENT, activebackground=SURFACE,
+                       activeforeground=TEXT_MUTED, font=("Segoe UI", 9),
+                       highlightthickness=0, bd=0).pack(side="right")
 
         # ── Search + Sort bar ──
         search_bar = tk.Frame(self, bg=BG)
@@ -499,6 +555,12 @@ class SessionLauncher(tk.Tk):
         self.search_entry.insert(0, "Search projects...")
         self.search_entry.bind("<FocusIn>", self._search_focus_in)
         self.search_entry.bind("<FocusOut>", self._search_focus_out)
+        # Session search button
+        ss_btn = tk.Button(search_bar, text="\U0001f50e Deep", bg=SURFACE2, fg=TEXT_MUTED,
+                           font=("Segoe UI", 8), relief="flat", padx=8, pady=3,
+                           activebackground=BORDER, cursor="hand2", command=self._show_session_search)
+        ss_btn.pack(side="left", padx=(0, 8))
+        _hover_btn(ss_btn, SURFACE2, BORDER)
 
         sort_frame = tk.Frame(search_bar, bg=BG)
         sort_frame.pack(side="right")
@@ -522,7 +584,8 @@ class SessionLauncher(tk.Tk):
         _hover_btn(sel_none, SURFACE2, BORDER)
         legend = tk.Frame(toolbar, bg=BG)
         legend.pack(side="left", padx=(6, 0))
-        for sym, color, label in [("\u2605", GOLD, "pinned"), ("\u2713", GREEN, "clean"), ("\u26a0", YELLOW, "interrupted")]:
+        for sym, color, label in [("\u2605", GOLD, "pinned"), ("\u2713", GREEN, "clean"),
+                                  ("\u26a0", YELLOW, "interrupted"), ("\u25cf", CYAN, "new")]:
             tk.Label(legend, text=sym, bg=BG, fg=color, font=("Segoe UI", 9)).pack(side="left")
             tk.Label(legend, text=label, bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(1, 8))
         self.project_count_label = tk.Label(toolbar, text="", bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 8))
@@ -539,7 +602,7 @@ class SessionLauncher(tk.Tk):
 
         # ── Scrollable project list ──
         container = tk.Frame(self, bg=BG)
-        container.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+        container.pack(fill="both", expand=True, padx=20, pady=(0, 0))
         self.canvas = tk.Canvas(container, bg=BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(container, orient="vertical", command=self.canvas.yview,
                                  bg=BG, troughcolor=BG, width=8, relief="flat")
@@ -554,6 +617,17 @@ class SessionLauncher(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         self.bind_all("<MouseWheel>",
                       lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+        # ── Status bar ──
+        self.status_bar = tk.Frame(self, bg=SURFACE)
+        self.status_bar.pack(fill="x", side="bottom")
+        self.status_label = tk.Label(self.status_bar, text="", bg=SURFACE, fg=TEXT_MUTED,
+                                      font=("Consolas", 8), anchor="w")
+        self.status_label.pack(side="left", padx=12, pady=3)
+        self.status_right = tk.Label(self.status_bar, text="", bg=SURFACE, fg=TEXT_MUTED,
+                                      font=("Consolas", 8), anchor="e")
+        self.status_right.pack(side="right", padx=12, pady=3)
+
         self._refresh_projects()
 
     # ── Search placeholder ──
@@ -573,11 +647,18 @@ class SessionLauncher(tk.Tk):
     # ── Window management ──
 
     def _on_close(self):
+        self._save_geometry()
         self.iconify()
+        self._show_toast("Minimized to taskbar \u2014 use Quit to exit")
 
     def _quit_app(self):
+        self._save_geometry()
         self._watcher_running = False
         self.destroy()
+
+    def _save_geometry(self):
+        self.config_data["geometry"] = self.geometry()
+        save_config(self.config_data)
 
     def _on_escape(self):
         if self.search_var.get() and not self._search_placeholder_on:
@@ -585,11 +666,69 @@ class SessionLauncher(tk.Tk):
             self.focus_set()
         else:
             self._select_none()
+            self._focused_idx = -1
+            self._highlight_focused()
 
     def _focus_search(self):
         self.search_entry.focus_set()
         if not self._search_placeholder_on:
             self.search_entry.select_range(0, tk.END)
+
+    # ── Always on top ──
+
+    def _on_topmost_toggle(self, *_a):
+        self.attributes('-topmost', self.always_on_top.get())
+
+    # ── Keyboard card navigation ──
+
+    def _on_arrow_down(self, e):
+        if isinstance(self.focus_get(), (tk.Entry, ttk.Combobox, tk.Listbox)):
+            return
+        if not self._card_order:
+            return
+        self._focused_idx = min(self._focused_idx + 1, len(self._card_order) - 1)
+        self._highlight_focused()
+        return "break"
+
+    def _on_arrow_up(self, e):
+        if isinstance(self.focus_get(), (tk.Entry, ttk.Combobox, tk.Listbox)):
+            return
+        if not self._card_order:
+            return
+        self._focused_idx = max(self._focused_idx - 1, 0)
+        self._highlight_focused()
+        return "break"
+
+    def _on_space_key(self, e):
+        if isinstance(self.focus_get(), (tk.Entry, ttk.Combobox, tk.Listbox, tk.Text)):
+            return
+        if 0 <= self._focused_idx < len(self._card_order):
+            key = self._card_order[self._focused_idx]
+            if key in self.project_checks:
+                self.project_checks[key].set(not self.project_checks[key].get())
+                self._update_bulk_count()
+            return "break"
+
+    def _highlight_focused(self):
+        for key, widget in self._card_widgets.items():
+            widget.config(highlightthickness=0)
+        if 0 <= self._focused_idx < len(self._card_order):
+            key = self._card_order[self._focused_idx]
+            if key in self._card_widgets:
+                widget = self._card_widgets[key]
+                widget.config(highlightbackground=ACCENT, highlightcolor=ACCENT, highlightthickness=2)
+                self.canvas.update_idletasks()
+                widget.update_idletasks()
+                y = widget.winfo_y()
+                h = widget.winfo_height()
+                scroll_h = self.scrollable.winfo_height()
+                if scroll_h > 0:
+                    canvas_h = self.canvas.winfo_height()
+                    top = self.canvas.canvasy(0)
+                    if y < top:
+                        self.canvas.yview_moveto(y / scroll_h)
+                    elif y + h > top + canvas_h:
+                        self.canvas.yview_moveto((y + h - canvas_h) / scroll_h)
 
     # ── Event handlers ──
 
@@ -656,12 +795,12 @@ class SessionLauncher(tk.Tk):
             return
         popup = tk.Toplevel(self)
         popup.title("Hidden Projects")
-        popup.geometry("450x350")
+        popup.geometry("500x400")
         popup.configure(bg=BG)
         popup.transient(self)
         popup.bind("<Escape>", lambda e: popup.destroy())
         popup.update_idletasks()
-        popup.geometry(f"+{self.winfo_x() + 185}+{self.winfo_y() + 125}")
+        popup.geometry(f"+{self.winfo_x() + 160}+{self.winfo_y() + 100}")
         tk.Label(popup, text="Hidden Projects", bg=BG, fg=TEXT,
                  font=("Segoe UI", 13, "bold")).pack(pady=(12, 8))
         for name in list(hidden):
@@ -676,8 +815,69 @@ class SessionLauncher(tk.Tk):
                     self._show_hidden_projects()
             tk.Button(row, text="Unhide", bg=ACCENT, fg=TEXT, font=("Segoe UI", 8),
                       relief="flat", padx=8, pady=2, cursor="hand2", command=_do).pack(side="right", padx=8, pady=4)
-        tk.Button(popup, text="Close", bg=SURFACE2, fg=TEXT_DIM, font=("Segoe UI", 9),
-                  relief="flat", padx=14, pady=4, cursor="hand2", command=popup.destroy).pack(pady=10)
+        btn_row = tk.Frame(popup, bg=BG)
+        btn_row.pack(pady=10)
+        tk.Button(btn_row, text="Unhide All", bg=SURFACE2, fg=TEXT_DIM, font=("Segoe UI", 9),
+                  relief="flat", padx=14, pady=4, cursor="hand2",
+                  command=lambda: self._unhide_all(popup)).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Delete Hidden Data", bg=RED, fg=TEXT, font=("Segoe UI", 9),
+                  relief="flat", padx=14, pady=4, cursor="hand2",
+                  command=lambda: self._delete_hidden_data(popup)).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Close", bg=SURFACE2, fg=TEXT_DIM, font=("Segoe UI", 9),
+                  relief="flat", padx=14, pady=4, cursor="hand2", command=popup.destroy).pack(side="left", padx=4)
+
+    def _unhide_all(self, popup):
+        self.config_data["hidden"] = []
+        save_config(self.config_data)
+        popup.destroy()
+        self._rerender_projects()
+        self._show_toast("All projects unhidden")
+
+    def _delete_hidden_data(self, popup):
+        hidden = self.config_data.get("hidden", [])
+        if not hidden:
+            return
+        if not messagebox.askyesno("Delete Hidden Data",
+                f"Permanently delete session data for {len(hidden)} hidden project(s)?\n\n"
+                "This removes JSONL files from ~/.claude/projects/.\n"
+                "This cannot be undone.", icon="warning"):
+            return
+        deleted = 0
+        for name in list(hidden):
+            proj_dir = PROJECTS_DIR / name
+            if proj_dir.exists():
+                try:
+                    shutil.rmtree(proj_dir)
+                    deleted += 1
+                except OSError:
+                    pass
+        self.config_data["hidden"] = []
+        save_config(self.config_data)
+        popup.destroy()
+        self._refresh_projects()
+        self._show_toast(f"Deleted {deleted} project(s)")
+
+    # ── Clipboard operations ──
+
+    def _copy_to_clipboard(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._show_toast(f"Copied: {text[:40]}...")
+
+    # ── Session deletion ──
+
+    def _delete_session(self, session_file: Path, encoded_name: str):
+        name = session_file.stem[:12]
+        if not messagebox.askyesno("Delete Session",
+                f"Delete session {name}...?\n\nThis removes the JSONL file permanently.",
+                icon="warning"):
+            return
+        try:
+            session_file.unlink()
+            self._show_toast(f"Session {name}... deleted")
+            self._refresh_projects()
+        except OSError as e:
+            self._show_toast(f"Error: {e}")
 
     # ── Toast notification ──
 
@@ -848,6 +1048,7 @@ class SessionLauncher(tk.Tk):
                 flags = self.config_data.get("custom_flags", {}).get(proj['encoded_name'], "")
                 launch_session(proj['decoded_path'], self.skip_perms.get(), self.mode.get(),
                                extra_flags=flags)
+                self._record_launch(proj['encoded_name'])
                 self._flash_card(proj['encoded_name'])
             palette.destroy()
 
@@ -873,6 +1074,183 @@ class SessionLauncher(tk.Tk):
         palette.bind("<FocusOut>", lambda e: palette.after(100, palette.destroy))
         listbox.bind("<Double-Button-1>", _launch_selected)
         _refresh_list()
+
+    # ── Session search (Ctrl+G) ──
+
+    def _show_session_search(self):
+        popup = tk.Toplevel(self)
+        popup.title("Search Sessions")
+        popup.geometry("700x480")
+        popup.configure(bg=BG)
+        popup.transient(self)
+        popup.bind("<Escape>", lambda e: popup.destroy())
+        popup.update_idletasks()
+        popup.geometry(f"+{self.winfo_x() + 60}+{self.winfo_y() + 60}")
+
+        sf = tk.Frame(popup, bg=BG)
+        sf.pack(fill="x", padx=12, pady=(12, 4))
+        tk.Label(sf, text="\U0001f50e", bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 11)).pack(side="left")
+        entry = tk.Entry(sf, bg=SURFACE2, fg=TEXT, font=("Consolas", 11),
+                         insertbackground=TEXT, relief="flat")
+        entry.pack(side="left", fill="x", expand=True, padx=8, pady=4)
+        entry.focus_set()
+
+        results_frame = tk.Frame(popup, bg=BG)
+        results_frame.pack(fill="both", expand=True, padx=12, pady=4)
+        results_list = tk.Listbox(results_frame, bg=SURFACE, fg=TEXT, font=("Consolas", 9),
+                                  selectbackground=ACCENT, selectforeground=TEXT,
+                                  highlightthickness=0, bd=0, activestyle="none")
+        results_list.pack(fill="both", expand=True)
+
+        status = tk.Label(popup, text="Type 3+ chars to search across all sessions...",
+                          bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 8))
+        status.pack(pady=(0, 8))
+
+        _results_data = []
+        _search_gen = [0]
+        _search_timer = [None]
+
+        def _schedule_search(*_a):
+            if _search_timer[0]:
+                popup.after_cancel(_search_timer[0])
+            _search_timer[0] = popup.after(400, _do_search)
+
+        def _do_search():
+            query = entry.get().strip()
+            if len(query) < 3:
+                results_list.delete(0, tk.END)
+                _results_data.clear()
+                status.config(text="Type 3+ chars to search...")
+                return
+            gen = _search_gen[0] + 1
+            _search_gen[0] = gen
+            results_list.delete(0, tk.END)
+            _results_data.clear()
+            status.config(text="Searching...")
+
+            def _search():
+                matches = []
+                q = query.lower()
+                try:
+                    for d in PROJECTS_DIR.iterdir():
+                        if not d.is_dir() or d.name == 'memory':
+                            continue
+                        if _search_gen[0] != gen:
+                            return
+                        proj_name = get_real_path(d, d.name)
+                        for jf in d.glob("*.jsonl"):
+                            try:
+                                with open(jf, 'rb') as f:
+                                    raw = f.read().decode('utf-8', errors='ignore')
+                                for line in raw.split('\n'):
+                                    if q not in line.lower():
+                                        continue
+                                    try:
+                                        ld = json.loads(line)
+                                        msg = ld.get('message', {})
+                                        content = msg.get('content', '')
+                                        text = ""
+                                        if isinstance(content, list):
+                                            for block in content:
+                                                if isinstance(block, dict) and block.get('type') == 'text':
+                                                    text = block.get('text', '')
+                                                    break
+                                        elif isinstance(content, str):
+                                            text = content
+                                        if text and q in text.lower():
+                                            idx = text.lower().index(q)
+                                            start = max(0, idx - 30)
+                                            end = min(len(text), idx + len(query) + 30)
+                                            snippet = text[start:end].replace('\n', ' ').strip()
+                                            matches.append({
+                                                'project': Path(proj_name).name,
+                                                'session_id': jf.stem,
+                                                'snippet': snippet,
+                                                'encoded_name': d.name,
+                                            })
+                                            if len(matches) >= 50:
+                                                break
+                                    except (json.JSONDecodeError, KeyError):
+                                        continue
+                            except OSError:
+                                continue
+                            if len(matches) >= 50:
+                                break
+                        if len(matches) >= 50:
+                            break
+                except Exception:
+                    pass
+
+                if _search_gen[0] != gen:
+                    return
+                def _update():
+                    _results_data.clear()
+                    _results_data.extend(matches)
+                    results_list.delete(0, tk.END)
+                    for m in matches:
+                        results_list.insert(tk.END,
+                            f"  {_project_emoji(m['project'])} {m['project']}  |  ...{m['snippet'][:60]}...")
+                    status.config(text=f"{len(matches)} result{'s' if len(matches) != 1 else ''}")
+                try:
+                    popup.after(0, _update)
+                except Exception:
+                    pass
+            threading.Thread(target=_search, daemon=True).start()
+
+        def _on_dbl(e):
+            sel = results_list.curselection()
+            if sel and sel[0] < len(_results_data):
+                m = _results_data[sel[0]]
+                for p in getattr(self, '_cached_projects', []):
+                    if p['encoded_name'] == m['encoded_name']:
+                        sl = p['sessions'][:15]
+                        for i, s in enumerate(sl):
+                            if s['id'] == m['session_id']:
+                                popup.destroy()
+                                self._show_preview_popup(p, None, sl, i)
+                                return
+                        break
+
+        entry.bind("<KeyRelease>", _schedule_search)
+        results_list.bind("<Double-Button-1>", _on_dbl)
+
+    # ── Launch history ──
+
+    def _record_launch(self, encoded_name):
+        hist = self.config_data.get("launch_history", {})
+        launches = hist.get(encoded_name, [])
+        launches.append(datetime.now().isoformat())
+        launches = launches[-20:]
+        hist[encoded_name] = launches
+        self.config_data["launch_history"] = hist
+        save_config(self.config_data)
+
+    def _get_launch_count(self, encoded_name):
+        return len(self.config_data.get("launch_history", {}).get(encoded_name, []))
+
+    # ── Last seen / notification dot ──
+
+    def _update_last_seen(self):
+        """Record current time so we can detect new activity later."""
+        ls = self.config_data.get("last_seen", {})
+        ls["_app_opened"] = datetime.now().timestamp()
+        self.config_data["last_seen"] = ls
+        save_config(self.config_data)
+
+    def _is_new_activity(self, encoded_name, last_active):
+        """Check if project has new activity since last app open."""
+        if last_active is None:
+            return False
+        ls = self.config_data.get("last_seen", {})
+        last_opened = ls.get("_app_opened", 0)
+        prev_seen = ls.get(encoded_name, last_opened)
+        return last_active.timestamp() > prev_seen
+
+    def _mark_seen(self, encoded_name, last_active):
+        if last_active:
+            ls = self.config_data.get("last_seen", {})
+            ls[encoded_name] = last_active.timestamp()
+            self.config_data["last_seen"] = ls
 
     # ── Bulk operations ──
 
@@ -918,7 +1296,7 @@ class SessionLauncher(tk.Tk):
     def _launch_selected(self):
         mode = self.mode.get()
         skip = self.skip_perms.get()
-        launched = []
+        to_launch = []
         for key, var in self.project_checks.items():
             if not var.get():
                 continue
@@ -933,10 +1311,32 @@ class SessionLauncher(tk.Tk):
                     idx = dd.current() if dd.current() >= 0 else 0
                     session_id = sids[idx]
             flags = self.config_data.get("custom_flags", {}).get(key, "")
-            launch_session(proj['decoded_path'], skip, mode, session_id, extra_flags=flags)
-            launched.append(key)
-        for key in launched:
-            self._flash_card(key)
+            to_launch.append((key, proj, session_id, flags))
+
+        if not to_launch:
+            return
+
+        # Confirm if launching 3+
+        if len(to_launch) >= 3:
+            names = "\n".join(f"  \u2022 {Path(t[1]['decoded_path']).name}" for t in to_launch[:10])
+            if len(to_launch) > 10:
+                names += f"\n  ... and {len(to_launch) - 10} more"
+            if not messagebox.askyesno("Bulk Launch",
+                    f"Launch {len(to_launch)} sessions?\n\n{names}\n\n"
+                    f"Sessions will be staggered by 2 seconds."):
+                return
+
+        # Launch with stagger for 3+
+        for i, (key, proj, session_id, flags) in enumerate(to_launch):
+            delay = i * 2000 if len(to_launch) >= 3 else 0
+            def _do(p=proj, s=session_id, f=flags, k=key):
+                launch_session(p['decoded_path'], skip, mode, s, extra_flags=f)
+                self._record_launch(k)
+                self._flash_card(k)
+            if delay:
+                self.after(delay, _do)
+            else:
+                _do()
 
     def _flash_card(self, key):
         if key in self._card_frames:
@@ -961,8 +1361,10 @@ class SessionLauncher(tk.Tk):
     def _on_projects_loaded(self, projects):
         self._cached_projects = projects
         self._loading = False
+        self._last_refresh = datetime.now()
         self.loading_label.pack_forget()
         self._render_project_list()
+        self._update_status_bar()
 
     def _rerender_projects(self):
         if not hasattr(self, '_cached_projects') or not self._cached_projects:
@@ -1012,6 +1414,8 @@ class SessionLauncher(tk.Tk):
         self.project_dropdowns.clear()
         self._card_frames.clear()
         self._card_order.clear()
+        self._card_widgets.clear()
+        self._focused_idx = -1
 
         if not hasattr(self, '_cached_projects') or not self._cached_projects:
             tk.Label(self.scrollable, text="No projects found in ~/.claude/projects/",
@@ -1049,22 +1453,47 @@ class SessionLauncher(tk.Tk):
         self._update_project_count(len(filtered), total)
         self._update_bulk_count()
 
+        # Save last_seen for all visible projects
+        for proj in filtered:
+            self._mark_seen(proj['encoded_name'], proj['last_active'])
+        save_config(self.config_data)
+
     def _update_project_count(self, shown, total):
         if shown == total:
             self.project_count_label.config(text=f"{total} project{'s' if total != 1 else ''}")
         else:
             self.project_count_label.config(text=f"{shown} of {total} projects")
 
+    def _update_status_bar(self):
+        if not hasattr(self, '_cached_projects'):
+            return
+        total_p = len(self._cached_projects)
+        total_s = sum(len(p['sessions']) for p in self._cached_projects)
+        total_sz = sum(s['size'] for p in self._cached_projects for s in p['sessions'])
+        if total_sz < 1_000_000:
+            sz = f"{total_sz // 1024}KB"
+        else:
+            sz = f"{total_sz / 1_000_000:.1f}MB"
+        tok = _token_estimate(total_sz)
+        self.status_label.config(
+            text=f"  {total_p} projects \u00b7 {total_s} sessions \u00b7 {sz} (~{tok})")
+        ref = _relative_time(self._last_refresh) if self._last_refresh else ""
+        shortcuts = "\u2191\u2193 navigate \u00b7 Space select \u00b7 Ctrl+P palette \u00b7 Ctrl+G search"
+        self.status_right.config(text=f"{shortcuts}  \u00b7  {ref}  ")
+
     def _add_project_card(self, proj):
         key = proj['encoded_name']
         path_exists = os.path.isdir(proj['decoded_path'])
         is_pinned = proj.get('pinned', False)
         compact = self.compact_mode.get()
+        has_new = self._is_new_activity(key, proj['last_active'])
+        launch_count = self._get_launch_count(key)
         self.project_data[key] = proj
         self._card_order.append(key)
 
-        card_outer = tk.Frame(self.scrollable, bg=BG)
+        card_outer = tk.Frame(self.scrollable, bg=BG, highlightthickness=0)
         card_outer.pack(fill="x", pady=2 if compact else 3)
+        self._card_widgets[key] = card_outer
         stripe_color = GOLD if is_pinned else (ACCENT if path_exists else RED)
         stripe = tk.Frame(card_outer, bg=stripe_color, width=4)
         stripe.pack(side="left", fill="y")
@@ -1079,6 +1508,7 @@ class SessionLauncher(tk.Tk):
             if path_exists:
                 flags = self.config_data.get("custom_flags", {}).get(p['encoded_name'], "")
                 launch_session(p['decoded_path'], self.skip_perms.get(), self.mode.get(), extra_flags=flags)
+                self._record_launch(p['encoded_name'])
                 self._flash_card(p['encoded_name'])
         card.bind("<Double-Button-1>", _dbl)
 
@@ -1098,6 +1528,12 @@ class SessionLauncher(tk.Tk):
             if p['sessions']:
                 menu.add_command(label="Add note...", command=lambda: self._edit_session_note(p['sessions'][0]['id']))
             menu.add_separator()
+            # Clipboard operations
+            menu.add_command(label="Copy path", command=lambda: self._copy_to_clipboard(p['decoded_path']))
+            if p['sessions']:
+                menu.add_command(label="Copy session ID",
+                                command=lambda: self._copy_to_clipboard(p['sessions'][0]['id']))
+            menu.add_separator()
             if path_exists:
                 menu.add_command(label="Open in editor",
                                 command=lambda: subprocess.Popen(["code", p['decoded_path']],
@@ -1109,6 +1545,9 @@ class SessionLauncher(tk.Tk):
                 else:
                     menu.add_command(label="Open folder", command=lambda: subprocess.Popen(["xdg-open", p['decoded_path']]))
             menu.add_separator()
+            if p['sessions']:
+                menu.add_command(label="Delete latest session...",
+                                command=lambda: self._delete_session(p['sessions'][0]['file'], p['encoded_name']))
             menu.add_command(label="Hide / Archive", command=lambda: self._hide_project(p['encoded_name']))
             menu.tk_popup(e.x_root, e.y_root)
         card.bind("<Button-3>", _ctx)
@@ -1144,6 +1583,10 @@ class SessionLauncher(tk.Tk):
         if is_pinned:
             tk.Label(name_row, text="\u2605", bg=SURFACE, fg=GOLD, font=("Segoe UI", 11)).pack(side="left")
 
+        # Notification dot for new activity
+        if has_new:
+            tk.Label(name_row, text="\u25cf", bg=SURFACE, fg=CYAN, font=("Segoe UI", 9)).pack(side="left", padx=(2, 0))
+
         tk.Label(name_row, text=f" {emoji} {name}", bg=SURFACE, fg=TEXT,
                  font=("Segoe UI", 11 if compact else 12, "bold"), anchor="w").pack(side="left")
 
@@ -1163,10 +1606,21 @@ class SessionLauncher(tk.Tk):
             tk.Label(name_row, text=f" {size_label} ", bg=SURFACE, fg=size_fg,
                      font=("Segoe UI", 7)).pack(side="left", padx=(4, 0))
 
+        # Token estimate
+        if proj['sessions']:
+            total_sz = sum(s['size'] for s in proj['sessions'])
+            tk.Label(name_row, text=f" ~{_token_estimate(total_sz)} ", bg=SURFACE, fg=TEXT_MUTED,
+                     font=("Segoe UI", 7)).pack(side="left", padx=(2, 0))
+
         # Custom flags indicator
         if self.config_data.get("custom_flags", {}).get(key):
             tk.Label(name_row, text=" \u2699", bg=SURFACE, fg=TEXT_MUTED,
                      font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+
+        # Launch count
+        if launch_count > 0:
+            tk.Label(name_row, text=f" {launch_count}\u00d7", bg=SURFACE, fg=TEXT_MUTED,
+                     font=("Segoe UI", 7)).pack(side="left", padx=(4, 0))
 
         if not compact:
             # Pin toggle
@@ -1200,16 +1654,22 @@ class SessionLauncher(tk.Tk):
                     tk.Label(info, text=f'\u201c{snippet}\u201d', bg=SURFACE, fg=PREVIEW,
                              font=("Segoe UI", 8, "italic"), anchor="w").pack(fill="x", pady=(1, 0))
 
-            # Metadata with relative time
+            # Metadata with relative time + duration
             if proj['last_active']:
                 rel = _relative_time(proj['last_active'])
                 n = len(proj['sessions'])
-                tk.Label(info, text=f"{rel}  \u00b7  {n} session{'s' if n != 1 else ''}",
+                dur = ""
+                if proj['sessions'] and proj['sessions'][0].get('duration', 0) > 60:
+                    dur = f"  \u00b7  {_duration_str(proj['sessions'][0]['duration'])}"
+                tk.Label(info, text=f"{rel}  \u00b7  {n} session{'s' if n != 1 else ''}{dur}",
                          bg=SURFACE, fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w").pack(fill="x", pady=(2, 0))
         else:
-            # Compact: just relative time
+            # Compact: just relative time + duration
             if proj['last_active']:
-                tk.Label(name_row, text=f"  {_relative_time(proj['last_active'])}",
+                dur = ""
+                if proj['sessions'] and proj['sessions'][0].get('duration', 0) > 60:
+                    dur = f" \u00b7 {_duration_str(proj['sessions'][0]['duration'])}"
+                tk.Label(name_row, text=f"  {_relative_time(proj['last_active'])}{dur}",
                          bg=SURFACE, fg=TEXT_MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
 
         # ── Right: dropdown + buttons ──
@@ -1222,9 +1682,10 @@ class SessionLauncher(tk.Tk):
             labels = []
             for s in proj['sessions'][:15]:
                 mark = "\u26a0" if s.get('health') == 'interrupted' else ""
-                labels.append(f"{mark}{s['id'][:8]}.. {s['modified'].strftime('%m/%d %H:%M')}")
+                dur = _duration_str(s['duration']) if s.get('duration', 0) > 60 else ""
+                labels.append(f"{mark}{s['id'][:8]}.. {s['modified'].strftime('%m/%d %H:%M')} {dur}")
             sv = tk.StringVar(value=labels[0] if labels else "")
-            dropdown = ttk.Combobox(right, textvariable=sv, values=labels, width=20, state="readonly")
+            dropdown = ttk.Combobox(right, textvariable=sv, values=labels, width=24, state="readonly")
             dropdown.pack(pady=(0, 4))
             self.project_dropdowns[key] = dropdown
 
@@ -1246,6 +1707,7 @@ class SessionLauncher(tk.Tk):
                 sid = sids[idx]
             flags = self.config_data.get("custom_flags", {}).get(p['encoded_name'], "")
             launch_session(p['decoded_path'], self.skip_perms.get(), mode, sid, extra_flags=flags)
+            self._record_launch(p['encoded_name'])
             self._flash_card(p['encoded_name'])
 
         bg = ACCENT if path_exists else "#4a4a4a"
@@ -1292,9 +1754,9 @@ class SessionLauncher(tk.Tk):
 
     # ── Preview popup ──
 
-    def _show_preview_popup(self, proj, dropdown, session_list):
-        idx = 0
-        if dropdown:
+    def _show_preview_popup(self, proj, dropdown, session_list, start_idx=0):
+        idx = start_idx
+        if dropdown and start_idx == 0:
             sel = dropdown.current()
             if sel >= 0:
                 idx = sel
@@ -1306,6 +1768,8 @@ class SessionLauncher(tk.Tk):
         turns = self._load_full_preview(session_file)
         files = get_session_files(session_file)
         note = self.config_data.get("notes", {}).get(session['id'], "")
+        dur = _duration_str(session['duration']) if session.get('duration', 0) > 60 else ""
+        tok = _token_estimate(session['size'])
 
         popup = tk.Toplevel(self)
         popup.title(f"Session Preview \u2014 {name}")
@@ -1332,6 +1796,11 @@ class SessionLauncher(tk.Tk):
         ht = "\u2713 clean" if h == 'clean' else ("\u26a0 interrupted" if h == 'interrupted' else "")
         hf = GREEN if h == 'clean' else (YELLOW if h == 'interrupted' else TEXT_MUTED)
         tk.Label(ri, text=ht, bg="#18162a", fg=hf, font=("Consolas", 9, "bold")).pack(side="right", padx=(8, 0))
+        if dur:
+            tk.Label(ri, text=f"{dur} \u00b7 ", bg="#18162a", fg=TEXT_MUTED,
+                     font=("Consolas", 9)).pack(side="right")
+        tk.Label(ri, text=f"~{tok} \u00b7 ", bg="#18162a", fg=TEXT_MUTED,
+                 font=("Consolas", 9)).pack(side="right")
         tk.Label(ri, text=_relative_time(session['modified']), bg="#18162a", fg=TEXT_MUTED,
                  font=("Consolas", 9)).pack(side="right")
 
@@ -1392,18 +1861,55 @@ class SessionLauncher(tk.Tk):
         # Bottom bar
         bot = tk.Frame(popup, bg="#18162a")
         bot.pack(fill="x")
-        cbtn = tk.Button(bot, text="Close", bg=SURFACE2, fg=TEXT_DIM, font=("Segoe UI", 9),
+
+        # Navigation: Prev / Next
+        nav_frame = tk.Frame(bot, bg="#18162a")
+        nav_frame.pack(side="left", padx=10, pady=6)
+        if idx > 0:
+            prev_btn = tk.Button(nav_frame, text="\u25c0 Prev", bg=SURFACE2, fg=TEXT_DIM,
+                                 font=("Segoe UI", 8), relief="flat", padx=8, pady=3,
+                                 activebackground=BORDER, cursor="hand2",
+                                 command=lambda: (popup.destroy(),
+                                     self._show_preview_popup(proj, None, session_list, idx - 1)))
+            prev_btn.pack(side="left", padx=(0, 4))
+            _hover_btn(prev_btn, SURFACE2, BORDER)
+        tk.Label(nav_frame, text=f"{idx + 1}/{len(session_list)}", bg="#18162a", fg=TEXT_MUTED,
+                 font=("Consolas", 8)).pack(side="left", padx=4)
+        if idx < len(session_list) - 1:
+            next_btn = tk.Button(nav_frame, text="Next \u25b6", bg=SURFACE2, fg=TEXT_DIM,
+                                 font=("Segoe UI", 8), relief="flat", padx=8, pady=3,
+                                 activebackground=BORDER, cursor="hand2",
+                                 command=lambda: (popup.destroy(),
+                                     self._show_preview_popup(proj, None, session_list, idx + 1)))
+            next_btn.pack(side="left", padx=(4, 0))
+            _hover_btn(next_btn, SURFACE2, BORDER)
+
+        tk.Label(bot, text=f"{len(turns)} messages  \u00b7  {len(files)} files",
+                 bg="#18162a", fg=TEXT_MUTED, font=("Consolas", 8)).pack(side="left", padx=(8, 0), pady=6)
+
+        right_btns = tk.Frame(bot, bg="#18162a")
+        right_btns.pack(side="right", padx=10, pady=6)
+        cbtn = tk.Button(right_btns, text="Close", bg=SURFACE2, fg=TEXT_DIM, font=("Segoe UI", 9),
                          relief="flat", padx=14, pady=4, activebackground=BORDER,
                          cursor="hand2", command=popup.destroy)
-        cbtn.pack(side="right", padx=10, pady=6)
+        cbtn.pack(side="right", padx=2)
         _hover_btn(cbtn, SURFACE2, BORDER)
-        nbtn = tk.Button(bot, text="\U0001f4cc Note", bg=SURFACE2, fg=TEXT_DIM, font=("Segoe UI", 9),
+        nbtn = tk.Button(right_btns, text="\U0001f4cc Note", bg=SURFACE2, fg=TEXT_DIM, font=("Segoe UI", 9),
                          relief="flat", padx=10, pady=4, activebackground=BORDER,
                          cursor="hand2", command=lambda: self._edit_session_note(session['id']))
-        nbtn.pack(side="right", padx=2, pady=6)
+        nbtn.pack(side="right", padx=2)
         _hover_btn(nbtn, SURFACE2, BORDER)
-        tk.Label(bot, text=f"{len(turns)} messages  \u00b7  {len(files)} files",
-                 bg="#18162a", fg=TEXT_MUTED, font=("Consolas", 8)).pack(side="left", padx=10, pady=6)
+        cpbtn = tk.Button(right_btns, text="Copy ID", bg=SURFACE2, fg=TEXT_DIM, font=("Segoe UI", 9),
+                          relief="flat", padx=10, pady=4, activebackground=BORDER,
+                          cursor="hand2", command=lambda: self._copy_to_clipboard(session['id']))
+        cpbtn.pack(side="right", padx=2)
+        _hover_btn(cpbtn, SURFACE2, BORDER)
+
+        # Keyboard nav in preview
+        popup.bind("<Left>", lambda e: (popup.destroy(),
+            self._show_preview_popup(proj, None, session_list, max(0, idx - 1))) if idx > 0 else None)
+        popup.bind("<Right>", lambda e: (popup.destroy(),
+            self._show_preview_popup(proj, None, session_list, min(len(session_list) - 1, idx + 1))) if idx < len(session_list) - 1 else None)
 
     def _update_wraplength(self, container, wrap):
         for child in container.winfo_children():
