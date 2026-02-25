@@ -682,7 +682,8 @@ class SessionLauncher(tk.Tk):
     # ── Keyboard card navigation ──
 
     def _on_arrow_down(self, e):
-        if isinstance(self.focus_get(), (tk.Entry, ttk.Combobox, tk.Listbox)):
+        if isinstance(self.focus_get(), (tk.Entry, ttk.Combobox, tk.Listbox,
+                                         tk.Checkbutton, tk.Radiobutton)):
             return
         if not self._card_order:
             return
@@ -691,7 +692,8 @@ class SessionLauncher(tk.Tk):
         return "break"
 
     def _on_arrow_up(self, e):
-        if isinstance(self.focus_get(), (tk.Entry, ttk.Combobox, tk.Listbox)):
+        if isinstance(self.focus_get(), (tk.Entry, ttk.Combobox, tk.Listbox,
+                                         tk.Checkbutton, tk.Radiobutton)):
             return
         if not self._card_order:
             return
@@ -700,7 +702,9 @@ class SessionLauncher(tk.Tk):
         return "break"
 
     def _on_space_key(self, e):
-        if isinstance(self.focus_get(), (tk.Entry, ttk.Combobox, tk.Listbox, tk.Text)):
+        focused = self.focus_get()
+        if isinstance(focused, (tk.Entry, ttk.Combobox, tk.Listbox, tk.Text,
+                                tk.Checkbutton, tk.Radiobutton)):
             return
         if 0 <= self._focused_idx < len(self._card_order):
             key = self._card_order[self._focused_idx]
@@ -740,7 +744,7 @@ class SessionLauncher(tk.Tk):
     def _on_compact_toggle(self, *_a):
         self.config_data["compact"] = self.compact_mode.get()
         save_config(self.config_data)
-        self._rerender_projects()
+        self.after(50, self._rerender_projects)
 
     def _on_search_change(self, *_a):
         if not self._search_placeholder_on:
