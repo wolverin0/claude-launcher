@@ -13,6 +13,7 @@ import threading
 import time
 import platform
 import shutil
+import ctypes
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CONFIG_FILE = Path.home() / ".claude" / "launcher-config.json"
@@ -461,6 +462,7 @@ class SessionLauncher(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._start_file_watcher()
         self._update_last_seen()
+        self._setup_tray()
 
     def _center_window(self):
         self.update_idletasks()
@@ -648,17 +650,144 @@ class SessionLauncher(tk.Tk):
 
     def _on_close(self):
         self._save_geometry()
-        self.iconify()
-        self._show_toast("Minimized to taskbar \u2014 use Quit to exit")
+        self.withdraw()
 
     def _quit_app(self):
+        self._remove_tray()
         self._save_geometry()
         self._watcher_running = False
         self.destroy()
 
     def _save_geometry(self):
-        self.config_data["geometry"] = self.geometry()
-        save_config(self.config_data)
+        try:
+            self.config_data["geometry"] = self.geometry()
+            save_config(self.config_data)
+        except Exception:
+            pass
+
+    # ── System Tray (Windows) ──
+
+    def _setup_tray(self):
+        if not IS_WINDOWS:
+            return
+        try:
+            from ctypes import wintypes, WINFUNCTYPE, byref, sizeof, c_wchar, c_int, c_long
+
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+            kernel32 = ctypes.windll.kernel32
+
+            WM_TRAYICON = 0x0420
+            WM_COMMAND = 0x0111
+            WM_LBUTTONUP = 0x0202
+            WM_LBUTTONDBLCLK = 0x0203
+            WM_RBUTTONUP = 0x0205
+
+            WNDPROC = WINFUNCTYPE(c_long, wintypes.HWND, wintypes.UINT,
+                                  wintypes.WPARAM, wintypes.LPARAM)
+
+            class WNDCLASSEXW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.UINT), ("style", wintypes.UINT),
+                    ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", c_int), ("cbWndExtra", c_int),
+                    ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                    ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                    ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+                    ("hIconSm", wintypes.HICON),
+                ]
+
+            class NOTIFYICONDATAW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                    ("uID", wintypes.UINT), ("uFlags", wintypes.UINT),
+                    ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
+                    ("szTip", c_wchar * 128),
+                ]
+
+            app = self
+
+            def _wnd_proc(hwnd, msg, wp, lp):
+                try:
+                    if msg == WM_TRAYICON:
+                        if lp in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                            app.after(0, app._tray_restore)
+                        elif lp == WM_RBUTTONUP:
+                            menu = user32.CreatePopupMenu()
+                            user32.InsertMenuW(menu, 0, 0x0, 1, "Show")
+                            user32.InsertMenuW(menu, 1, 0x0, 2, "Quit")
+                            pt = wintypes.POINT()
+                            user32.GetCursorPos(byref(pt))
+                            user32.SetForegroundWindow(hwnd)
+                            user32.TrackPopupMenu(menu, 0, pt.x, pt.y, 0, hwnd, None)
+                            user32.DestroyMenu(menu)
+                    elif msg == WM_COMMAND:
+                        if (wp & 0xFFFF) == 1:
+                            app.after(0, app._tray_restore)
+                        elif (wp & 0xFFFF) == 2:
+                            app.after(0, app._tray_quit)
+                except Exception:
+                    pass
+                return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+            self._tray_wndproc = WNDPROC(_wnd_proc)
+
+            def _create():
+                try:
+                    hinst = kernel32.GetModuleHandleW(None)
+                    wc = WNDCLASSEXW()
+                    wc.cbSize = sizeof(WNDCLASSEXW)
+                    wc.lpfnWndProc = self._tray_wndproc
+                    wc.hInstance = hinst
+                    wc.lpszClassName = "ClaudeLauncherTray"
+                    if not user32.RegisterClassExW(byref(wc)):
+                        return
+                    hwnd = user32.CreateWindowExW(
+                        0, "ClaudeLauncherTray", "Tray", 0,
+                        0, 0, 0, 0, None, None, hinst, None)
+                    if not hwnd:
+                        return
+                    self._tray_hwnd = hwnd
+                    icon = user32.LoadIconW(0, 32512)
+                    nid = NOTIFYICONDATAW()
+                    nid.cbSize = sizeof(NOTIFYICONDATAW)
+                    nid.hWnd = hwnd
+                    nid.uID = 1
+                    nid.uFlags = 0x1 | 0x2 | 0x4
+                    nid.uCallbackMessage = WM_TRAYICON
+                    nid.hIcon = icon
+                    nid.szTip = "Claude Code Launcher"
+                    shell32.Shell_NotifyIconW(0, byref(nid))
+                    self._tray_nid = nid
+                    msg = wintypes.MSG()
+                    while user32.GetMessageW(byref(msg), None, 0, 0) > 0:
+                        user32.TranslateMessage(byref(msg))
+                        user32.DispatchMessageW(byref(msg))
+                except Exception:
+                    pass
+
+            threading.Thread(target=_create, daemon=True).start()
+        except Exception:
+            pass
+
+    def _remove_tray(self):
+        if hasattr(self, '_tray_nid'):
+            try:
+                ctypes.windll.shell32.Shell_NotifyIconW(
+                    0x2, ctypes.byref(self._tray_nid))
+            except Exception:
+                pass
+
+    def _tray_restore(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _tray_quit(self):
+        self._remove_tray()
+        self._save_geometry()
+        self._watcher_running = False
+        self.destroy()
 
     def _on_escape(self):
         if self.search_var.get() and not self._search_placeholder_on:
