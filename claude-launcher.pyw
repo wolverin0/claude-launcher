@@ -216,6 +216,60 @@ def _friendly_tool(name: str) -> str:
             'WebFetch': 'Web', 'WebSearch': 'Web'}.get(name, name)
 
 
+def get_session_cost(session_file: Path) -> dict:
+    """Extract cost/token metrics from session JSONL."""
+    result = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+    try:
+        with open(session_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    if d.get('type') == 'summary':
+                        result["cost_usd"] = d.get('costUSD', d.get('cost_usd', 0)) or 0
+                        result["input_tokens"] = d.get('inputTokens', d.get('input_tokens', 0)) or 0
+                        result["output_tokens"] = d.get('outputTokens', d.get('output_tokens', 0)) or 0
+                    elif d.get('costUSD') or d.get('cost_usd'):
+                        result["cost_usd"] = d.get('costUSD', d.get('cost_usd', 0)) or 0
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    except OSError:
+        pass
+    return result
+
+
+def export_session_markdown(session_file: Path) -> str:
+    """Export a session as clean markdown text."""
+    lines = []
+    try:
+        with open(session_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for raw in f:
+                try:
+                    d = json.loads(raw)
+                    msg = d.get('message', {})
+                    role = msg.get('role', '')
+                    content = msg.get('content', '')
+                    text = ""
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                t = block.get('text', '').strip()
+                                if t:
+                                    text = t
+                    elif isinstance(content, str):
+                        text = content.strip()
+                    if not text or text.startswith(('<system', '<teammate', '<local-command', '<command-name', '<hook')):
+                        continue
+                    if role == 'user' and len(text) > 3:
+                        lines.append(f"\n## User\n\n{text}\n")
+                    elif role == 'assistant' and text:
+                        lines.append(f"\n## Assistant\n\n{text}\n")
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    except OSError:
+        pass
+    return "\n".join(lines)
+
+
 def get_session_health(session_file: Path) -> str:
     try:
         fsize = session_file.stat().st_size
@@ -310,31 +364,42 @@ def get_projects() -> list:
 
 
 def launch_session(decoded_path: str, skip_permissions: bool, mode: str,
-                   session_id: str = None, extra_flags: str = ""):
+                   session_id: str = None, extra_flags: str = "",
+                   remote_control: bool = False, model: str = "",
+                   agent_teams: bool = False):
     args = ["claude"]
-    if mode == "continue":
+    if remote_control:
+        args.append("remote-control")
+    elif mode == "continue":
         args.append("--continue")
     elif mode == "resume" and session_id:
         args.extend(["-r", session_id])
     if skip_permissions:
         args.append("--dangerously-skip-permissions")
+    if model:
+        args.extend(["--model", model])
     if extra_flags:
         args.extend(extra_flags.split())
     cmd_str = " ".join(args)
+    env_prefix = "set CLAUDECODE="
+    if agent_teams:
+        env_prefix += " && set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
     quoted_path = decoded_path.replace('"', '')
     if IS_WINDOWS:
-        launch_cmd = f"set CLAUDECODE= && {cmd_str}"
+        launch_cmd = f"{env_prefix} && {cmd_str}"
         try:
             subprocess.Popen(["wt", "-d", quoted_path, "cmd", "/k", launch_cmd])
         except FileNotFoundError:
             subprocess.Popen(f'start cmd /k "cd /d "{quoted_path}" && {launch_cmd}"', shell=True)
     elif IS_MAC:
+        teams_env = "export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 && " if agent_teams else ""
         script = (f'tell application "Terminal"\n'
-                  f'  do script "cd \\"{quoted_path}\\" && unset CLAUDECODE && {cmd_str}"\n'
+                  f'  do script "cd \\"{quoted_path}\\" && unset CLAUDECODE && {teams_env}{cmd_str}"\n'
                   f'  activate\nend tell')
         subprocess.Popen(["osascript", "-e", script])
     else:
-        launch_cmd = f"cd '{quoted_path}' && unset CLAUDECODE && {cmd_str}"
+        teams_env = "export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 && " if agent_teams else ""
+        launch_cmd = f"cd '{quoted_path}' && unset CLAUDECODE && {teams_env}{cmd_str}"
         for term in ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"]:
             try:
                 if term == "gnome-terminal":
@@ -404,6 +469,8 @@ class SessionLauncher(tk.Tk):
 
         self.config_data = load_config()
         self.skip_perms = tk.BooleanVar(value=True)
+        self.remote_control = tk.BooleanVar(value=self.config_data.get("remote_control", False))
+        self.remote_control.trace_add("write", self._on_remote_control_toggle)
         self.mode = tk.StringVar(value="continue")
         self.auto_start = tk.BooleanVar(value=self.config_data.get("auto_start", False))
         self.auto_start.trace_add("write", self._on_autostart_toggle)
@@ -477,6 +544,14 @@ class SessionLauncher(tk.Tk):
                         foreground=TEXT_DIM, selectbackground=ACCENT, arrowcolor=TEXT_DIM, borderwidth=0)
         style.map("TCombobox", fieldbackground=[("readonly", SURFACE2)],
                   selectbackground=[("readonly", ACCENT)], foreground=[("readonly", TEXT_DIM)])
+        style.configure("Dark.TNotebook", background=BG, borderwidth=0)
+        style.configure("Dark.TNotebook.Tab", background=SURFACE, foreground=TEXT_MUTED,
+                        padding=[14, 6], font=("Segoe UI", 10))
+        style.map("Dark.TNotebook.Tab",
+                  background=[("selected", ACCENT), ("active", SURFACE2)],
+                  foreground=[("selected", TEXT), ("active", TEXT)],
+                  expand=[("selected", [0, 0, 0, 2])])
+        style.layout("Dark.TNotebook", [("Dark.TNotebook.client", {"sticky": "nswe"})])
         self.option_add("*TCombobox*Listbox.background", SURFACE2)
         self.option_add("*TCombobox*Listbox.foreground", TEXT_DIM)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
@@ -508,14 +583,24 @@ class SessionLauncher(tk.Tk):
         refresh_btn.pack(side="right", pady=(4, 0))
         _hover_btn(refresh_btn, SURFACE2, BORDER)
 
+        # ── Notebook (tabs) ──
+        self.notebook = ttk.Notebook(self, style="Dark.TNotebook")
+        self.notebook.pack(fill="both", expand=True, padx=0, pady=(8, 0))
+        projects_tab = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(projects_tab, text="  Projects  ")
+
         # ── Options panel ──
-        opts_outer = tk.Frame(self, bg=BORDER)
-        opts_outer.pack(fill="x", padx=20, pady=(12, 0), ipady=1)
+        opts_outer = tk.Frame(projects_tab, bg=BORDER)
+        opts_outer.pack(fill="x", padx=16, pady=(8, 0), ipady=1)
         opts = tk.Frame(opts_outer, bg=SURFACE)
         opts.pack(fill="x", padx=1, pady=1, ipady=8)
         left_opts = tk.Frame(opts, bg=SURFACE)
         left_opts.pack(side="left", padx=(14, 0))
         tk.Checkbutton(left_opts, text="Skip permissions", variable=self.skip_perms,
+                       bg=SURFACE, fg=TEXT, selectcolor=ACCENT, activebackground=SURFACE,
+                       activeforeground=TEXT, font=("Segoe UI", 10),
+                       highlightthickness=0, bd=0).pack(side="left", padx=(0, 12))
+        tk.Checkbutton(left_opts, text="Remote control", variable=self.remote_control,
                        bg=SURFACE, fg=TEXT, selectcolor=ACCENT, activebackground=SURFACE,
                        activeforeground=TEXT, font=("Segoe UI", 10),
                        highlightthickness=0, bd=0).pack(side="left", padx=(0, 20))
@@ -544,8 +629,8 @@ class SessionLauncher(tk.Tk):
                        highlightthickness=0, bd=0).pack(side="right")
 
         # ── Search + Sort bar ──
-        search_bar = tk.Frame(self, bg=BG)
-        search_bar.pack(fill="x", padx=20, pady=(10, 0))
+        search_bar = tk.Frame(projects_tab, bg=BG)
+        search_bar.pack(fill="x", padx=16, pady=(8, 0))
         search_frame = tk.Frame(search_bar, bg=SURFACE2)
         search_frame.pack(side="left", fill="x", expand=True, padx=(0, 8))
         tk.Label(search_frame, text=" \U0001f50d", bg=SURFACE2, fg=TEXT_MUTED,
@@ -572,8 +657,8 @@ class SessionLauncher(tk.Tk):
                      values=["recent", "name", "sessions"], width=10, state="readonly").pack(side="left")
 
         # ── Toolbar ──
-        toolbar = tk.Frame(self, bg=BG)
-        toolbar.pack(fill="x", padx=20, pady=(8, 6))
+        toolbar = tk.Frame(projects_tab, bg=BG)
+        toolbar.pack(fill="x", padx=16, pady=(6, 4))
         sel_all = tk.Button(toolbar, text="Select All", bg=SURFACE2, fg=TEXT_DIM,
                             font=("Segoe UI", 9), relief="flat", padx=10, pady=4,
                             activebackground=BORDER, cursor="hand2", command=self._select_all)
@@ -599,12 +684,12 @@ class SessionLauncher(tk.Tk):
         self.bulk_launch_btn.pack(side="right")
 
         # ── Loading indicator ──
-        self.loading_label = tk.Label(self, text="\u23f3 Loading projects...",
+        self.loading_label = tk.Label(projects_tab, text="\u23f3 Loading projects...",
                                        bg=BG, fg=ACCENT, font=("Segoe UI", 11))
 
         # ── Scrollable project list ──
-        container = tk.Frame(self, bg=BG)
-        container.pack(fill="both", expand=True, padx=20, pady=(0, 0))
+        container = tk.Frame(projects_tab, bg=BG)
+        container.pack(fill="both", expand=True, padx=16, pady=(0, 0))
         self.canvas = tk.Canvas(container, bg=BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(container, orient="vertical", command=self.canvas.yview,
                                  bg=BG, troughcolor=BG, width=8, relief="flat")
@@ -629,6 +714,14 @@ class SessionLauncher(tk.Tk):
         self.status_right = tk.Label(self.status_bar, text="", bg=SURFACE, fg=TEXT_MUTED,
                                       font=("Consolas", 8), anchor="e")
         self.status_right.pack(side="right", padx=12, pady=3)
+
+        # ── Additional tabs ──
+        self._build_sessions_tab()
+        self._build_hooks_tab()
+        self._build_mcp_tab()
+        self._build_plugins_tab()
+        self._build_profiles_tab()
+        self._build_claudemd_tab()
 
         self._refresh_projects()
 
@@ -863,7 +956,811 @@ class SessionLauncher(tk.Tk):
                     elif y + h > top + canvas_h:
                         self.canvas.yview_moveto((y + h - canvas_h) / scroll_h)
 
+    # ── Sessions tab ──
+
+    def _build_sessions_tab(self):
+        frame = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(frame, text="  Sessions  ")
+        search_row = tk.Frame(frame, bg=BG)
+        search_row.pack(fill="x", padx=14, pady=(10, 0))
+        sf = tk.Frame(search_row, bg=SURFACE2)
+        sf.pack(side="left", fill="x", expand=True)
+        tk.Label(sf, text=" \U0001f50d", bg=SURFACE2, fg=TEXT_MUTED, font=("Segoe UI", 10)).pack(side="left")
+        self.sessions_search_var = tk.StringVar()
+        self.sessions_search_var.trace_add("write", lambda *_: self._sessions_apply_filter())
+        tk.Entry(sf, textvariable=self.sessions_search_var, bg=SURFACE2, fg=TEXT,
+                 font=("Segoe UI", 10), insertbackground=TEXT, relief="flat", bd=0
+                 ).pack(side="left", fill="x", expand=True, padx=6, pady=6)
+        self.sessions_stats_label = tk.Label(frame, text="Loading...", bg=BG, fg=TEXT_MUTED,
+                                              font=("Consolas", 8), anchor="w")
+        self.sessions_stats_label.pack(fill="x", padx=16, pady=(4, 2))
+        hdr = tk.Frame(frame, bg=SURFACE)
+        hdr.pack(fill="x", padx=14)
+        for txt, w in [("Project", 18), ("Session ID", 14), ("Date", 10), ("Dur", 7), ("Tokens", 7), ("Cost", 7), ("Health", 8)]:
+            tk.Label(hdr, text=txt, bg=SURFACE, fg=TEXT_MUTED, font=("Consolas", 8, "bold"),
+                     width=w, anchor="w").pack(side="left", padx=(4, 0), pady=3)
+        list_frame = tk.Frame(frame, bg=BG)
+        list_frame.pack(fill="both", expand=True, padx=14)
+        self.sessions_listbox = tk.Listbox(list_frame, bg=SURFACE, fg=TEXT, font=("Consolas", 9),
+            selectbackground=ACCENT, selectforeground=TEXT, relief="flat", bd=0,
+            activestyle="none", highlightthickness=0)
+        slb_sb = tk.Scrollbar(list_frame, orient="vertical", command=self.sessions_listbox.yview,
+                               bg=BG, troughcolor=BG, width=8, relief="flat")
+        self.sessions_listbox.configure(yscrollcommand=slb_sb.set)
+        self.sessions_listbox.pack(side="left", fill="both", expand=True)
+        slb_sb.pack(side="right", fill="y")
+        self.sessions_listbox.bind("<<ListboxSelect>>", self._on_session_select)
+        preview_outer = tk.Frame(frame, bg=BORDER)
+        preview_outer.pack(fill="x", padx=14, pady=(4, 6), ipady=1)
+        preview_inner = tk.Frame(preview_outer, bg=SURFACE2)
+        preview_inner.pack(fill="both", expand=True, padx=1, pady=1)
+        tk.Label(preview_inner, text="Conversation preview", bg=SURFACE2, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", padx=8, pady=(4, 0))
+        self.sessions_preview = tk.Text(preview_inner, bg=SURFACE2, fg=TEXT_DIM,
+                                         font=("Consolas", 8), relief="flat", bd=0,
+                                         height=5, state="disabled", wrap="word", highlightthickness=0)
+        self.sessions_preview.pack(fill="x", padx=8, pady=(2, 4))
+        self.sessions_preview.tag_configure("user", foreground=CYAN)
+        self.sessions_preview.tag_configure("assistant", foreground=TEXT_DIM)
+        self.sessions_preview.tag_configure("tool", foreground=TEXT_MUTED)
+        self.sessions_preview.tag_configure("files_hdr", foreground=GOLD)
+        btn_row = tk.Frame(frame, bg=BG)
+        btn_row.pack(fill="x", padx=14, pady=(0, 4))
+        export_btn = tk.Button(btn_row, text="Export MD", bg=SURFACE2, fg=CYAN,
+                               font=("Segoe UI", 9), relief="flat", padx=10, pady=3,
+                               cursor="hand2", command=self._sessions_export)
+        export_btn.pack(side="left")
+        _hover_btn(export_btn, SURFACE2, ACCENT)
+        self._sessions_all = []
+        self._sessions_filtered = []
+        threading.Thread(target=self._sessions_load_bg, daemon=True).start()
+
+    def _sessions_load_bg(self):
+        rows, total_bytes, total_cost = [], 0, 0.0
+        try:
+            projects = get_projects()
+        except Exception:
+            projects = []
+        for p in projects:
+            name = p['decoded_path'].split('/')[-1].split('\\')[-1] or p['encoded_name']
+            for s in p.get('sessions', []):
+                cost_info = get_session_cost(s['file'])
+                s['cost_usd'] = cost_info['cost_usd']
+                total_cost += cost_info['cost_usd']
+                rows.append((name, s))
+                total_bytes += s.get('size', 0)
+        rows.sort(key=lambda x: x[1]['modified'], reverse=True)
+        n_proj = len({r[0] for r in rows})
+        cost_str = f"${total_cost:.2f}" if total_cost > 0 else "$0"
+        stats = f"{len(rows)} sessions across {n_proj} projects  |  ~{_token_estimate(total_bytes)} tokens  |  {cost_str} total cost"
+        self._sessions_all = rows
+        self._sessions_filtered = rows[:]
+        self.after(0, lambda: self._sessions_render(stats))
+
+    def _sessions_apply_filter(self):
+        q = self.sessions_search_var.get().lower().strip()
+        if not q:
+            self._sessions_filtered = self._sessions_all[:]
+        else:
+            self._sessions_filtered = [
+                (name, s) for name, s in self._sessions_all
+                if q in name.lower() or q in s['id'].lower()
+                or any(q in t['text'].lower() for t in s.get('preview', []))
+            ]
+        self._sessions_render(None)
+
+    def _sessions_render(self, stats):
+        lb = self.sessions_listbox
+        lb.delete(0, tk.END)
+        for name, s in self._sessions_filtered:
+            proj = name[:16].ljust(16)
+            sid = s['id'][:12].ljust(12)
+            date = _relative_time(s['modified']).ljust(8)
+            dur = _duration_str(s['duration']).ljust(5)
+            tok = _token_estimate(s['size']).ljust(5)
+            cost = s.get('cost_usd', 0)
+            cost_s = f"${cost:.2f}".ljust(5) if cost > 0 else "  -  "
+            hmark = "clean" if s['health'] == "clean" else "intrp" if s['health'] == "interrupted" else "  ?  "
+            lb.insert(tk.END, f"  {proj}  {sid}  {date}  {dur}  {tok}  {cost_s}  {hmark}")
+            color = GREEN if s['health'] == "clean" else GOLD if s['health'] == "interrupted" else TEXT_MUTED
+            lb.itemconfig(tk.END - 1, foreground=color)
+        if stats:
+            self.sessions_stats_label.config(text=stats)
+        elif not self._sessions_all:
+            self.sessions_stats_label.config(text="No sessions found")
+        else:
+            self.sessions_stats_label.config(text=f"Showing {len(self._sessions_filtered)} of {len(self._sessions_all)} sessions")
+
+    def _on_session_select(self, _event=None):
+        sel = self.sessions_listbox.curselection()
+        if not sel or sel[0] >= len(self._sessions_filtered):
+            return
+        _name, s = self._sessions_filtered[sel[0]]
+        turns = s.get('preview') or []
+        files = get_session_files(s['file']) if s.get('file') else []
+        pv = self.sessions_preview
+        pv.config(state="normal")
+        pv.delete("1.0", tk.END)
+        for t in turns:
+            prefix = "You: " if t['role'] == "user" else "AI:  " if t['role'] == "assistant" else "   > "
+            pv.insert(tk.END, prefix, t['role'])
+            pv.insert(tk.END, t['text'][:120] + "\n")
+        if files:
+            pv.insert(tk.END, "\nFiles touched: ", "files_hdr")
+            pv.insert(tk.END, "  ".join(f.split('/')[-1].split('\\')[-1] for f in files[:8]) + "\n", "tool")
+        pv.config(state="disabled")
+
+    def _sessions_export(self):
+        sel = self.sessions_listbox.curselection()
+        if not sel or sel[0] >= len(self._sessions_filtered):
+            self._show_toast("Select a session first")
+            return
+        _name, s = self._sessions_filtered[sel[0]]
+        path = filedialog.asksaveasfilename(
+            defaultextension=".md", filetypes=[("Markdown", "*.md")],
+            initialfile=f"session-{s['id'][:8]}.md")
+        if path:
+            md = export_session_markdown(s['file'])
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(f"# Session {s['id'][:12]}\n\n**Project:** {_name}\n**Date:** {s['modified']}\n\n---\n{md}")
+                self._show_toast(f"Exported to {Path(path).name}")
+            except OSError as e:
+                self._show_toast(f"Export failed: {e}")
+
+    # ── Hooks tab ──
+
+    def _build_hooks_tab(self):
+        frame = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(frame, text="  Hooks  ")
+        settings_file = Path.home() / ".claude" / "settings.json"
+        self._hooks_data = {}
+        self._hooks_unsaved = False
+        try:
+            if settings_file.exists():
+                raw = json.loads(settings_file.read_text(encoding="utf-8"))
+                self._hooks_data = raw.get("hooks", {})
+        except Exception:
+            pass
+        HOOK_EVENTS = ["SessionStart", "PreToolUse", "PostToolUse",
+                       "UserPromptSubmit", "Stop", "PreCompact"]
+        top = tk.Frame(frame, bg=BG)
+        top.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(top, text="Claude Hooks", bg=BG, fg=ACCENT, font=("Segoe UI", 13, "bold")).pack(side="left")
+        self._hooks_status = tk.Label(top, text="", bg=BG, fg=GOLD, font=("Segoe UI", 9))
+        self._hooks_status.pack(side="left", padx=10)
+        save_btn = tk.Button(top, text="Save", bg=ACCENT, fg=TEXT, relief="flat", padx=12, pady=3,
+                             font=("Segoe UI", 9, "bold"), cursor="hand2",
+                             command=lambda: self._hooks_save(settings_file))
+        save_btn.pack(side="right")
+        _hover_btn(save_btn, ACCENT, GREEN)
+        body = tk.Frame(frame, bg=BG)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
+        left = tk.Frame(body, bg=SURFACE, width=160, bd=0, highlightthickness=1, highlightbackground=BORDER)
+        left.pack(side="left", fill="y", padx=(0, 10))
+        left.pack_propagate(False)
+        tk.Label(left, text="Events", bg=SURFACE, fg=TEXT_DIM, font=("Segoe UI", 8, "bold")).pack(pady=(8, 4))
+        self._hooks_event_btns = {}
+        self._hooks_selected_event = tk.StringVar(value="")
+        right_scroll = tk.Frame(body, bg=BG)
+        right_scroll.pack(side="left", fill="both", expand=True)
+        hk_canvas = tk.Canvas(right_scroll, bg=BG, highlightthickness=0)
+        hk_sb = ttk.Scrollbar(right_scroll, orient="vertical", command=hk_canvas.yview)
+        hk_canvas.configure(yscrollcommand=hk_sb.set)
+        hk_sb.pack(side="right", fill="y")
+        hk_canvas.pack(side="left", fill="both", expand=True)
+        right_inner = tk.Frame(hk_canvas, bg=BG)
+        hk_win = hk_canvas.create_window((0, 0), window=right_inner, anchor="nw")
+        right_inner.bind("<Configure>", lambda e: hk_canvas.configure(scrollregion=hk_canvas.bbox("all")))
+        hk_canvas.bind("<Configure>", lambda e: hk_canvas.itemconfig(hk_win, width=e.width))
+        add_btn = tk.Button(top, text="+ Add Hook", bg=SURFACE2, fg=TEXT, relief="flat", padx=10, pady=3,
+                            font=("Segoe UI", 9), cursor="hand2",
+                            command=lambda: self._hooks_add_dialog(HOOK_EVENTS, right_inner))
+        add_btn.pack(side="right", padx=(0, 8))
+        def _select_event(evt):
+            self._hooks_selected_event.set(evt)
+            for e, b in self._hooks_event_btns.items():
+                b.configure(bg=ACCENT if e == evt else SURFACE, fg=TEXT if e == evt else TEXT_DIM)
+            self._hooks_render_groups(evt, right_inner)
+        for evt in HOOK_EVENTS:
+            b = tk.Button(left, text=evt, bg=SURFACE, fg=TEXT_DIM, relief="flat", anchor="w",
+                          padx=8, pady=5, font=("Segoe UI", 9), cursor="hand2", width=17,
+                          command=lambda e=evt: _select_event(e))
+            b.pack(fill="x", padx=4, pady=1)
+            self._hooks_event_btns[evt] = b
+        if HOOK_EVENTS:
+            _select_event(HOOK_EVENTS[0])
+
+    def _hooks_render_groups(self, event, container):
+        for w in container.winfo_children():
+            w.destroy()
+        groups = self._hooks_data.get(event, [])
+        tk.Label(container, text=event, bg=BG, fg=ACCENT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(4, 8))
+        if not groups:
+            tk.Label(container, text="No hooks configured for this event.",
+                     bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+            return
+        for idx, group in enumerate(groups):
+            is_disabled = group.get("_disabled", False)
+            card = tk.Frame(container, bg=SURFACE2, bd=0, highlightthickness=1, highlightbackground=BORDER)
+            card.pack(fill="x", pady=4, padx=2)
+            header = tk.Frame(card, bg=SURFACE2)
+            header.pack(fill="x", padx=8, pady=(6, 2))
+            matcher = group.get("matcher", "")
+            label_text = f"matcher: {matcher}" if matcher else "(no matcher)"
+            strike_font = ("Segoe UI", 9, "overstrike") if is_disabled else ("Segoe UI", 9, "bold")
+            fg_col = TEXT_MUTED if is_disabled else TEXT
+            tk.Label(header, text=label_text, bg=SURFACE2, fg=fg_col, font=strike_font).pack(side="left")
+            tog_text = "Enable" if is_disabled else "Disable"
+            tog_fg = GREEN if is_disabled else GOLD
+            def _toggle(i=idx, e=event, c=container):
+                self._hooks_data[e][i]["_disabled"] = not self._hooks_data[e][i].get("_disabled", False)
+                self._hooks_mark_unsaved()
+                self._hooks_render_groups(e, c)
+            tk.Button(header, text=tog_text, bg=SURFACE2, fg=tog_fg, relief="flat",
+                      font=("Segoe UI", 8), cursor="hand2", command=_toggle).pack(side="right", padx=(4, 0))
+            def _delete(i=idx, e=event, c=container):
+                self._hooks_data.setdefault(e, []).pop(i)
+                self._hooks_mark_unsaved()
+                self._hooks_render_groups(e, c)
+            tk.Button(header, text="\u2715", bg=SURFACE2, fg=RED, relief="flat",
+                      font=("Segoe UI", 8), cursor="hand2", command=_delete).pack(side="right")
+            for h in group.get("hooks", []):
+                cmd = h.get("command", "")
+                short = ("\u2026" + cmd[-48:]) if len(cmd) > 50 else cmd
+                timeout = h.get("timeout", "")
+                info = f"  cmd: {short}" + (f"  |  timeout: {timeout}s" if timeout else "")
+                tk.Label(card, text=info, bg=SURFACE2, fg=TEXT_MUTED if is_disabled else TEXT_DIM,
+                         font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=8, pady=(0, 4))
+
+    def _hooks_mark_unsaved(self):
+        self._hooks_unsaved = True
+        self._hooks_status.configure(text="\u25cf unsaved changes")
+
+    def _hooks_save(self, settings_file):
+        try:
+            raw = {}
+            if settings_file.exists():
+                raw = json.loads(settings_file.read_text(encoding="utf-8"))
+            clean = {}
+            for evt, groups in self._hooks_data.items():
+                clean[evt] = [{k: v for k, v in g.items() if k != "_disabled"} for g in groups]
+            raw["hooks"] = clean
+            settings_file.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._hooks_unsaved = False
+            self._hooks_status.configure(text="Saved", fg=GREEN)
+            self._hooks_status.after(3000, lambda: self._hooks_status.configure(
+                text="" if not self._hooks_unsaved else "\u25cf unsaved changes", fg=GOLD))
+        except Exception as ex:
+            self._hooks_status.configure(text=f"Error: {ex}", fg=RED)
+
+    def _hooks_add_dialog(self, events, container):
+        dlg = tk.Toplevel(bg=SURFACE)
+        dlg.title("Add Hook")
+        dlg.geometry("460x300")
+        dlg.resizable(False, False)
+        fields = {}
+        rows = [("Event", events[0], events), ("Matcher (optional)", "", None),
+                ("Command", "", None), ("Timeout (s, optional)", "", None)]
+        for i, (label, default, choices) in enumerate(rows):
+            tk.Label(dlg, text=label, bg=SURFACE, fg=TEXT_DIM, font=("Segoe UI", 9)
+                     ).grid(row=i, column=0, sticky="w", padx=14, pady=6)
+            if choices:
+                var = tk.StringVar(value=default)
+                ttk.Combobox(dlg, textvariable=var, values=choices, state="readonly", width=34
+                             ).grid(row=i, column=1, padx=14, pady=6)
+                fields[label] = var
+            else:
+                var = tk.StringVar(value=default)
+                tk.Entry(dlg, textvariable=var, bg=SURFACE2, fg=TEXT, insertbackground=TEXT, relief="flat", width=36
+                         ).grid(row=i, column=1, padx=14, pady=6)
+                fields[label] = var
+        def _confirm():
+            evt = fields["Event"].get()
+            matcher = fields["Matcher (optional)"].get().strip()
+            cmd = fields["Command"].get().strip()
+            if not cmd:
+                return
+            timeout_s = fields["Timeout (s, optional)"].get().strip()
+            hook = {"type": "command", "command": cmd}
+            if timeout_s.isdigit():
+                hook["timeout"] = int(timeout_s)
+            group = {"hooks": [hook]}
+            if matcher:
+                group["matcher"] = matcher
+            self._hooks_data.setdefault(evt, []).append(group)
+            self._hooks_mark_unsaved()
+            if self._hooks_selected_event.get() == evt:
+                self._hooks_render_groups(evt, container)
+            dlg.destroy()
+        tk.Button(dlg, text="Add", bg=ACCENT, fg=TEXT, relief="flat", padx=14, pady=4,
+                  font=("Segoe UI", 9, "bold"), cursor="hand2", command=_confirm
+                  ).grid(row=4, column=1, sticky="e", padx=14, pady=10)
+
+    # ── MCP Servers tab ──
+
+    def _build_mcp_tab(self):
+        frame = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(frame, text="  MCP Servers  ")
+        claude_json = Path.home() / ".claude.json"
+        try:
+            raw = json.loads(claude_json.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        self._mcp_data = raw
+        servers = raw.get("mcpServers", {})
+        disabled_set = set()
+        for proj in raw.get("projects", {}).values():
+            for d in proj.get("disabledMcpServers", []):
+                disabled_set.add(d.split(":")[-1])
+        self._mcp_unsaved = tk.BooleanVar(value=False)
+        self._mcp_selected = tk.StringVar(value="")
+        top = tk.Frame(frame, bg=BG)
+        top.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(top, text="MCP Servers", font=("Segoe UI", 13, "bold"), bg=BG, fg=TEXT).pack(side="left")
+        unsaved_lbl = tk.Label(top, text="\u25cf unsaved changes", font=("Segoe UI", 9), bg=BG, fg=YELLOW)
+        def _show_unsaved(*_):
+            if self._mcp_unsaved.get():
+                unsaved_lbl.pack(side="left", padx=8)
+            else:
+                unsaved_lbl.pack_forget()
+        self._mcp_unsaved.trace_add("write", _show_unsaved)
+        pane = tk.Frame(frame, bg=BG)
+        pane.pack(fill="both", expand=True, padx=12, pady=8)
+        left = tk.Frame(pane, bg=SURFACE, bd=0, highlightthickness=1, highlightbackground=BORDER)
+        left.pack(side="left", fill="both", expand=False, padx=(0, 8))
+        left.configure(width=220)
+        left.pack_propagate(False)
+        tk.Label(left, text="Servers", font=("Segoe UI", 9, "bold"), bg=SURFACE, fg=TEXT_DIM).pack(anchor="w", padx=8, pady=(8, 4))
+        cards_frame = tk.Frame(left, bg=SURFACE)
+        cards_frame.pack(fill="both", expand=True, padx=4)
+        right = tk.Frame(pane, bg=SURFACE, bd=0, highlightthickness=1, highlightbackground=BORDER)
+        right.pack(side="left", fill="both", expand=True)
+        detail_title = tk.Label(right, text="Select a server", font=("Segoe UI", 11, "bold"), bg=SURFACE, fg=TEXT)
+        detail_title.pack(anchor="w", padx=12, pady=(10, 4))
+        detail_body = tk.Frame(right, bg=SURFACE)
+        detail_body.pack(fill="both", expand=True, padx=12)
+        entry_refs = {}
+        def show_detail(name):
+            for w in detail_body.winfo_children():
+                w.destroy()
+            entry_refs.clear()
+            cfg = servers.get(name, {})
+            detail_title.config(text=name)
+            for label, val in [("type", cfg.get("type", "")), ("command", cfg.get("command", "")),
+                               ("args", " ".join(cfg.get("args", []))), ("url", cfg.get("url", "")),
+                               ("env", json.dumps(cfg.get("env", {})))]:
+                row = tk.Frame(detail_body, bg=SURFACE)
+                row.pack(fill="x", pady=2)
+                tk.Label(row, text=label, width=9, anchor="w", font=("Segoe UI", 9), bg=SURFACE, fg=TEXT_DIM).pack(side="left")
+                e = tk.Entry(row, font=("Segoe UI", 9), bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
+                             relief="flat", highlightthickness=1, highlightbackground=BORDER)
+                e.insert(0, val)
+                e.pack(side="left", fill="x", expand=True, ipady=3, padx=(4, 0))
+                e.bind("<Key>", lambda _: self._mcp_unsaved.set(True))
+                entry_refs[label] = e
+        def refresh_cards():
+            for w in cards_frame.winfo_children():
+                w.destroy()
+            for name, cfg in servers.items():
+                enabled = name not in disabled_set
+                dot_color = GREEN if enabled else RED
+                stype = cfg.get("type", "stdio")
+                hint = cfg.get("url", cfg.get("command", ""))[:28]
+                card = tk.Frame(cards_frame, bg=SURFACE2, cursor="hand2", highlightthickness=1, highlightbackground=BORDER)
+                card.pack(fill="x", pady=2)
+                tk.Label(card, text="\u25cf", font=("Segoe UI", 8), bg=SURFACE2, fg=dot_color).pack(side="left", padx=(6, 2))
+                info = tk.Frame(card, bg=SURFACE2)
+                info.pack(side="left", fill="x", expand=True, pady=4)
+                tk.Label(info, text=name, font=("Segoe UI", 9, "bold"), bg=SURFACE2, fg=TEXT, anchor="w").pack(anchor="w")
+                tk.Label(info, text=f"{stype}  {hint}", font=("Segoe UI", 8), bg=SURFACE2, fg=TEXT_MUTED, anchor="w").pack(anchor="w")
+                for w in (card, info):
+                    w.bind("<Button-1>", lambda _, n=name: [self._mcp_selected.set(n), show_detail(n)])
+        refresh_cards()
+        def save_servers():
+            if self._mcp_selected.get() and entry_refs:
+                name = self._mcp_selected.get()
+                cfg = servers.setdefault(name, {})
+                cfg["type"] = entry_refs["type"].get()
+                if cfg["type"] == "http":
+                    cfg["url"] = entry_refs["url"].get()
+                else:
+                    cfg["command"] = entry_refs["command"].get()
+                    cfg["args"] = entry_refs["args"].get().split()
+                try:
+                    cfg["env"] = json.loads(entry_refs["env"].get() or "{}")
+                except Exception:
+                    pass
+            self._mcp_data["mcpServers"] = servers
+            claude_json.write_text(json.dumps(self._mcp_data, indent=2), encoding="utf-8")
+            self._mcp_unsaved.set(False)
+        def add_server(prefill=None):
+            d = tk.Toplevel(frame)
+            d.title("Add MCP Server")
+            d.configure(bg=BG)
+            d.geometry("420x300")
+            d.resizable(False, False)
+            pf = prefill or {}
+            flds = {"Name": pf.get("name", ""), "Type": pf.get("type", "stdio"),
+                    "Command": pf.get("command", ""), "Args": " ".join(pf.get("args", [])),
+                    "URL": pf.get("url", ""), "Env (JSON)": "{}"}
+            entries = {}
+            for i, (lbl, default) in enumerate(flds.items()):
+                tk.Label(d, text=lbl, bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9)
+                         ).grid(row=i, column=0, sticky="w", padx=12, pady=4)
+                if lbl == "Type":
+                    var = tk.StringVar(value=default)
+                    ttk.Combobox(d, textvariable=var, values=["stdio", "http", "sse"],
+                                 state="readonly", width=28).grid(row=i, column=1, padx=8, pady=4)
+                    entries[lbl] = var
+                else:
+                    e = tk.Entry(d, bg=SURFACE2, fg=TEXT, insertbackground=TEXT, relief="flat",
+                                 highlightthickness=1, highlightbackground=BORDER, width=30)
+                    e.insert(0, default)
+                    e.grid(row=i, column=1, padx=8, pady=4, ipady=3)
+                    entries[lbl] = e
+            def confirm():
+                nm = entries["Name"].get().strip() if isinstance(entries["Name"], tk.Entry) else entries["Name"].get()
+                if not nm:
+                    return
+                cfg = {"type": entries["Type"].get()}
+                if cfg["type"] == "http":
+                    cfg["url"] = entries["URL"].get() if isinstance(entries["URL"], tk.Entry) else entries["URL"].get()
+                else:
+                    cfg["command"] = entries["Command"].get() if isinstance(entries["Command"], tk.Entry) else entries["Command"].get()
+                    args_val = entries["Args"].get() if isinstance(entries["Args"], tk.Entry) else entries["Args"].get()
+                    cfg["args"] = args_val.split()
+                try:
+                    env_val = entries["Env (JSON)"].get() if isinstance(entries["Env (JSON)"], tk.Entry) else entries["Env (JSON)"].get()
+                    cfg["env"] = json.loads(env_val or "{}")
+                except Exception:
+                    cfg["env"] = {}
+                servers[nm] = cfg
+                self._mcp_unsaved.set(True)
+                refresh_cards()
+                d.destroy()
+            tk.Button(d, text="Add", bg=ACCENT, fg=TEXT, relief="flat",
+                      font=("Segoe UI", 9, "bold"), command=confirm).grid(row=len(flds), column=1, sticky="e", padx=8, pady=8)
+        def remove_server():
+            name = self._mcp_selected.get()
+            if name and name in servers:
+                del servers[name]
+                self._mcp_selected.set("")
+                for w in detail_body.winfo_children():
+                    w.destroy()
+                detail_title.config(text="Select a server")
+                self._mcp_unsaved.set(True)
+                refresh_cards()
+        btn_bar = tk.Frame(frame, bg=BG)
+        btn_bar.pack(fill="x", padx=12, pady=(0, 6))
+        for txt, cmd, color in [("+ Add Server", lambda: add_server(), ACCENT),
+                                ("- Remove", remove_server, RED), ("Save", save_servers, GREEN)]:
+            b = tk.Button(btn_bar, text=txt, command=cmd, bg=color, fg=TEXT, relief="flat",
+                          font=("Segoe UI", 9, "bold"), padx=10, pady=4, cursor="hand2")
+            b.pack(side="left", padx=(0, 6))
+            _hover_btn(b, color, SURFACE2)
+        qa = tk.Frame(frame, bg=SURFACE, highlightthickness=1, highlightbackground=BORDER)
+        qa.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(qa, text="Quick Add:", font=("Segoe UI", 9, "bold"), bg=SURFACE, fg=TEXT_DIM).pack(side="left", padx=8, pady=6)
+        for label, pf in [
+            ("GitHub MCP", {"name": "github", "type": "http", "url": "https://api.githubcopilot.com/mcp/"}),
+            ("Playwright", {"name": "playwright", "type": "stdio", "command": "npx.cmd", "args": ["-y", "@playwright/mcp@latest"]}),
+            ("Filesystem", {"name": "filesystem", "type": "stdio", "command": "npx.cmd", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}),
+        ]:
+            b = tk.Button(qa, text=label, bg=SURFACE2, fg=CYAN, relief="flat", font=("Segoe UI", 9),
+                          padx=8, pady=3, cursor="hand2", command=lambda p=pf: add_server(p))
+            b.pack(side="left", padx=4, pady=6)
+            _hover_btn(b, SURFACE2, ACCENT)
+
+    # ── Plugins & Skills tab ──
+
+    def _build_plugins_tab(self):
+        frame = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(frame, text="  Plugins & Skills  ")
+        def parse_frontmatter(text):
+            meta = {}
+            if not text.startswith("---"):
+                return meta
+            parts = text.split("---", 2)
+            if len(parts) < 3:
+                return meta
+            for line in parts[1].splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    meta[k.strip()] = v.strip()
+            return meta
+        def load_data():
+            plugins, skills, agents = [], [], []
+            pf = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+            if pf.exists():
+                try:
+                    with open(pf) as f:
+                        plugins = json.load(f)
+                except Exception:
+                    pass
+            sd = Path.home() / ".claude" / "skills"
+            if sd.is_dir():
+                for d in sorted(sd.iterdir()):
+                    sm = d / "SKILL.md"
+                    if d.is_dir() and sm.exists():
+                        try:
+                            text = sm.read_text(encoding="utf-8", errors="ignore")
+                            meta = parse_frontmatter(text)
+                            skills.append({"name": meta.get("name", d.name), "description": meta.get("description", ""), "_text": text})
+                        except Exception:
+                            pass
+            ad = Path.home() / ".claude" / "agents"
+            if ad.is_dir():
+                for af in sorted(ad.glob("*.md")):
+                    try:
+                        text = af.read_text(encoding="utf-8", errors="ignore")
+                        meta = parse_frontmatter(text)
+                        agents.append({"name": meta.get("name", af.stem), "description": meta.get("description", ""),
+                                       "model": meta.get("model", "inherit"), "_text": text})
+                    except Exception:
+                        pass
+            return plugins, skills, agents
+        top = tk.Frame(frame, bg=SURFACE, pady=6, padx=10)
+        top.pack(fill="x")
+        stats_var = tk.StringVar(value="Loading...")
+        tk.Label(top, textvariable=stats_var, bg=SURFACE, fg=CYAN, font=("Consolas", 10)).pack(side="left")
+        paned = tk.PanedWindow(frame, orient="horizontal", bg=BG, sashwidth=4, sashrelief="flat")
+        paned.pack(fill="both", expand=True, pady=(4, 0))
+        left_pane = tk.Frame(paned, bg=BG)
+        paned.add(left_pane, minsize=260)
+        pl_canvas = tk.Canvas(left_pane, bg=BG, highlightthickness=0)
+        pl_sb = ttk.Scrollbar(left_pane, orient="vertical", command=pl_canvas.yview)
+        pl_canvas.configure(yscrollcommand=pl_sb.set)
+        pl_sb.pack(side="right", fill="y")
+        pl_canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(pl_canvas, bg=BG)
+        pl_win = pl_canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: pl_canvas.configure(scrollregion=pl_canvas.bbox("all")))
+        pl_canvas.bind("<Configure>", lambda e: pl_canvas.itemconfig(pl_win, width=e.width))
+        right_pane = tk.Frame(paned, bg=SURFACE, padx=12, pady=12)
+        paned.add(right_pane, minsize=220)
+        detail_title = tk.Label(right_pane, text="Select an item", bg=SURFACE, fg=ACCENT,
+                                font=("Consolas", 12, "bold"), anchor="w", wraplength=240)
+        detail_title.pack(fill="x")
+        detail_text = tk.Text(right_pane, bg=SURFACE2, fg=TEXT, relief="flat", font=("Consolas", 9),
+                              wrap="word", state="disabled", bd=0, padx=6, pady=6)
+        detail_text.pack(fill="both", expand=True, pady=(8, 0))
+        def show_detail(name, body):
+            detail_title.config(text=name)
+            detail_text.config(state="normal")
+            detail_text.delete("1.0", "end")
+            detail_text.insert("end", body)
+            detail_text.config(state="disabled")
+        def make_card(parent, label, sub, color, click_cb=None):
+            card = tk.Frame(parent, bg=SURFACE2, padx=10, pady=6, cursor="hand2" if click_cb else "")
+            card.pack(fill="x", padx=8, pady=2)
+            tk.Label(card, text=label, bg=SURFACE2, fg=color, font=("Consolas", 10, "bold"), anchor="w").pack(fill="x")
+            if sub:
+                tk.Label(card, text=sub, bg=SURFACE2, fg=TEXT_DIM, font=("Consolas", 9), anchor="w",
+                         wraplength=220, justify="left").pack(fill="x")
+            if click_cb:
+                for w in (card, *card.winfo_children()):
+                    w.bind("<Button-1>", lambda e, cb=click_cb: cb())
+        def section_header(text):
+            tk.Label(inner, text=text, bg=BG, fg=GOLD, font=("Consolas", 10, "bold"), anchor="w", padx=8).pack(fill="x", pady=(10, 2))
+        def refresh():
+            for w in inner.winfo_children():
+                w.destroy()
+            plugins, skills, agents = load_data()
+            stats_var.set(f"{len(plugins)} plugins  |  {len(skills)} skills  |  {len(agents)} agents")
+            section_header("Plugins")
+            if plugins:
+                for p in plugins:
+                    name = p.get("name", "Unknown") if isinstance(p, dict) else str(p)
+                    ver = p.get("version", "") if isinstance(p, dict) else ""
+                    desc = p.get("description", "") if isinstance(p, dict) else ""
+                    make_card(inner, f"{name}  {ver}".strip(), desc, PREVIEW)
+            else:
+                tk.Label(inner, text="  No plugins installed", bg=BG, fg=TEXT_MUTED, font=("Consolas", 9)).pack(anchor="w", padx=12)
+            section_header("Skills")
+            if skills:
+                for s in skills:
+                    make_card(inner, s["name"], s["description"], GREEN,
+                              click_cb=lambda s=s: show_detail(s["name"], s["_text"]))
+            else:
+                tk.Label(inner, text="  No skills found", bg=BG, fg=TEXT_MUTED, font=("Consolas", 9)).pack(anchor="w", padx=12)
+            section_header("Agents")
+            if agents:
+                for a in agents:
+                    sub = f"{a['description']}  [model: {a['model']}]".strip(" []")
+                    make_card(inner, a["name"], sub, CYAN,
+                              click_cb=lambda a=a: show_detail(a["name"], a["_text"]))
+            else:
+                tk.Label(inner, text="  No agents found", bg=BG, fg=TEXT_MUTED, font=("Consolas", 9)).pack(anchor="w", padx=12)
+        refresh_btn = tk.Button(top, text="\u27f3 Refresh", bg=SURFACE2, fg=TEXT, relief="flat", padx=8, command=refresh)
+        refresh_btn.pack(side="right")
+        _hover_btn(refresh_btn, SURFACE2, ACCENT)
+        refresh()
+
+    # ── Profiles tab ──
+
+    def _build_profiles_tab(self):
+        frame = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(frame, text="  Profiles  ")
+        prof_canvas = tk.Canvas(frame, bg=BG, highlightthickness=0)
+        prof_sb = ttk.Scrollbar(frame, orient="vertical", command=prof_canvas.yview)
+        inner = tk.Frame(prof_canvas, bg=BG)
+        inner.bind("<Configure>", lambda e: prof_canvas.configure(scrollregion=prof_canvas.bbox("all")))
+        prof_win = prof_canvas.create_window((0, 0), window=inner, anchor="nw")
+        prof_canvas.configure(yscrollcommand=prof_sb.set)
+        prof_canvas.bind("<Configure>", lambda e: prof_canvas.itemconfig(prof_win, width=e.width))
+        prof_canvas.pack(side="left", fill="both", expand=True)
+        prof_sb.pack(side="right", fill="y")
+        def section_label(parent, text):
+            tk.Label(parent, text=text, bg=BG, fg=ACCENT, font=("Consolas", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+            tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=12, pady=(0, 6))
+        section_label(inner, "Global Settings")
+        gs = tk.Frame(inner, bg=SURFACE, bd=0, highlightbackground=BORDER, highlightthickness=1)
+        gs.pack(fill="x", padx=12, pady=4)
+        row1 = tk.Frame(gs, bg=SURFACE)
+        row1.pack(fill="x", padx=10, pady=6)
+        tk.Label(row1, text="Model:", bg=SURFACE, fg=TEXT_DIM, width=22, anchor="w").pack(side="left")
+        model_var = tk.StringVar(value=self.config_data.get("default_model", "sonnet"))
+        ttk.Combobox(row1, textvariable=model_var, values=["sonnet", "opus", "haiku", "sonnet[1m]", "opus[1m]"], state="readonly", width=16).pack(side="left")
+        row2 = tk.Frame(gs, bg=SURFACE)
+        row2.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(row2, text="Permission Mode:", bg=SURFACE, fg=TEXT_DIM, width=22, anchor="w").pack(side="left")
+        perm_var = tk.StringVar(value=self.config_data.get("default_permission_mode", "default"))
+        ttk.Combobox(row2, textvariable=perm_var, values=["plan", "default", "bypassPermissions"], state="readonly", width=16).pack(side="left")
+        row3 = tk.Frame(gs, bg=SURFACE)
+        row3.pack(fill="x", padx=10, pady=(0, 8))
+        agent_teams_var = tk.BooleanVar(value=self.config_data.get("agent_teams", False))
+        tk.Checkbutton(row3, text="Enable Agent Teams (experimental)", variable=agent_teams_var,
+                       bg=SURFACE, fg=TEXT, selectcolor=ACCENT, activebackground=SURFACE,
+                       activeforeground=TEXT, font=("Segoe UI", 10), highlightthickness=0, bd=0).pack(side="left")
+        section_label(inner, "Quick Profiles")
+        qf = tk.Frame(inner, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        qf.pack(fill="x", padx=12, pady=4)
+        bf = tk.Frame(qf, bg=SURFACE)
+        bf.pack(fill="x", padx=10, pady=8)
+        for name, mdl, prm, color in [("Development", "sonnet", "bypassPermissions", GREEN),
+                                       ("Review", "opus", "plan", GOLD), ("Quick", "haiku", "bypassPermissions", CYAN)]:
+            btn = tk.Button(bf, text=name, bg=SURFACE2, fg=color, relief="flat", padx=10, cursor="hand2",
+                            command=lambda m=mdl, p=prm: (model_var.set(m), perm_var.set(p)))
+            btn.pack(side="left", padx=4)
+            _hover_btn(btn, SURFACE2, BORDER)
+        section_label(inner, "Per-Project Overrides")
+        pp = tk.Frame(inner, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        pp.pack(fill="x", padx=12, pady=4)
+        proj_names = []
+        try:
+            for p in get_projects():
+                proj_names.append(p['decoded_path'].split('/')[-1].split('\\')[-1] or p['encoded_name'])
+        except Exception:
+            pass
+        proj_var = tk.StringVar()
+        ttk.Combobox(pp, textvariable=proj_var, values=proj_names, state="readonly", width=52).pack(padx=10, pady=(8, 4), anchor="w")
+        ov_model_var = tk.StringVar()
+        ov_perm_var = tk.StringVar()
+        ov_flags_var = tk.StringVar()
+        ov_frame = tk.Frame(pp, bg=SURFACE)
+        ov_frame.pack(fill="x", padx=10, pady=4)
+        for lbl, var, vals in [("Model override:", ov_model_var, ["", "sonnet", "opus", "haiku", "sonnet[1m]", "opus[1m]"]),
+                               ("Perm override:", ov_perm_var, ["", "plan", "default", "bypassPermissions"])]:
+            r = tk.Frame(ov_frame, bg=SURFACE)
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=lbl, bg=SURFACE, fg=TEXT_DIM, width=18, anchor="w").pack(side="left")
+            ttk.Combobox(r, textvariable=var, values=vals, state="readonly", width=22).pack(side="left")
+        rf = tk.Frame(ov_frame, bg=SURFACE)
+        rf.pack(fill="x", pady=1)
+        tk.Label(rf, text="Custom flags:", bg=SURFACE, fg=TEXT_DIM, width=18, anchor="w").pack(side="left")
+        tk.Entry(rf, textvariable=ov_flags_var, bg=SURFACE2, fg=TEXT, insertbackground=TEXT, relief="flat", width=34).pack(side="left")
+        def on_proj_select(event=None):
+            key = proj_var.get()
+            ov = self.config_data.get("project_overrides", {}).get(key, {})
+            ov_model_var.set(ov.get("model", ""))
+            ov_perm_var.set(ov.get("permission_mode", ""))
+            ov_flags_var.set(ov.get("flags", ""))
+        proj_var.trace_add("write", lambda *_: on_proj_select())
+        sf = tk.Frame(inner, bg=BG)
+        sf.pack(fill="x", padx=12, pady=10)
+        def save_all():
+            self.config_data["default_model"] = model_var.get()
+            self.config_data["default_permission_mode"] = perm_var.get()
+            self.config_data["agent_teams"] = agent_teams_var.get()
+            key = proj_var.get()
+            if key:
+                self.config_data.setdefault("project_overrides", {})[key] = {
+                    "model": ov_model_var.get(), "permission_mode": ov_perm_var.get(), "flags": ov_flags_var.get()}
+            save_config(self.config_data)
+        save_btn = tk.Button(sf, text="Save Profiles", bg=ACCENT, fg=TEXT, relief="flat", padx=14, pady=5,
+                             cursor="hand2", command=save_all)
+        save_btn.pack(side="right")
+        _hover_btn(save_btn, ACCENT, "#6b47d6")
+
+    # ── CLAUDE.md Editor tab ──
+
+    def _build_claudemd_tab(self):
+        frame = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(frame, text="  CLAUDE.md  ")
+        top = tk.Frame(frame, bg=BG)
+        top.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(top, text="CLAUDE.md Editor", bg=BG, fg=ACCENT, font=("Segoe UI", 13, "bold")).pack(side="left")
+        self._claudemd_status = tk.Label(top, text="", bg=BG, fg=GOLD, font=("Segoe UI", 9))
+        self._claudemd_status.pack(side="left", padx=10)
+        save_btn = tk.Button(top, text="Save", bg=ACCENT, fg=TEXT, relief="flat", padx=12, pady=3,
+                             font=("Segoe UI", 9, "bold"), cursor="hand2", command=self._claudemd_save)
+        save_btn.pack(side="right")
+        _hover_btn(save_btn, ACCENT, GREEN)
+        sel_row = tk.Frame(frame, bg=BG)
+        sel_row.pack(fill="x", padx=12, pady=(8, 4))
+        tk.Label(sel_row, text="Scope:", bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9)).pack(side="left")
+        self._claudemd_scope = tk.StringVar(value="global")
+        scopes = ["global"]
+        try:
+            for p in get_projects():
+                name = p['decoded_path'].split('/')[-1].split('\\')[-1] or p['encoded_name']
+                scopes.append(name)
+        except Exception:
+            pass
+        self._claudemd_scope_map = {}
+        self._claudemd_scope_map["global"] = Path.home() / "CLAUDE.md"
+        try:
+            for p in get_projects():
+                name = p['decoded_path'].split('/')[-1].split('\\')[-1] or p['encoded_name']
+                self._claudemd_scope_map[name] = Path(p['decoded_path']) / "CLAUDE.md"
+        except Exception:
+            pass
+        scope_combo = ttk.Combobox(sel_row, textvariable=self._claudemd_scope,
+                                   values=scopes, state="readonly", width=40)
+        scope_combo.pack(side="left", padx=8)
+        self._claudemd_scope.trace_add("write", lambda *_: self._claudemd_load())
+        self._claudemd_editor = tk.Text(frame, bg=SURFACE, fg=TEXT, font=("Consolas", 10),
+                                         relief="flat", bd=0, insertbackground=TEXT,
+                                         wrap="word", undo=True, padx=10, pady=8)
+        self._claudemd_editor.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        self._claudemd_editor.bind("<Key>", lambda _: self._claudemd_status.configure(
+            text="\u25cf unsaved changes", fg=GOLD))
+        self._claudemd_load()
+
+    def _claudemd_load(self):
+        scope = self._claudemd_scope.get()
+        path = self._claudemd_scope_map.get(scope)
+        self._claudemd_editor.delete("1.0", tk.END)
+        self._claudemd_status.configure(text="", fg=GOLD)
+        if path and path.exists():
+            try:
+                content = path.read_text(encoding="utf-8", errors="ignore")
+                self._claudemd_editor.insert("1.0", content)
+                self._claudemd_status.configure(text=f"Loaded: {path}", fg=TEXT_MUTED)
+            except OSError:
+                self._claudemd_editor.insert("1.0", "# Error reading file")
+        else:
+            self._claudemd_editor.insert("1.0", f"# CLAUDE.md\n\n<!-- File will be created at {path} -->\n")
+            self._claudemd_status.configure(text="New file (will be created on save)", fg=CYAN)
+
+    def _claudemd_save(self):
+        scope = self._claudemd_scope.get()
+        path = self._claudemd_scope_map.get(scope)
+        if not path:
+            return
+        content = self._claudemd_editor.get("1.0", tk.END).rstrip()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content + "\n", encoding="utf-8")
+            self._claudemd_status.configure(text="Saved", fg=GREEN)
+            self._claudemd_status.after(3000, lambda: self._claudemd_status.configure(text="", fg=GOLD))
+        except OSError as e:
+            self._claudemd_status.configure(text=f"Error: {e}", fg=RED)
+
+    # ── Launch helpers ──
+
+    def _resolve_launch_opts(self, encoded_name=""):
+        ov = self.config_data.get("project_overrides", {}).get(encoded_name, {}) if encoded_name else {}
+        model = ov.get("model", "") or self.config_data.get("default_model", "")
+        agent_teams = self.config_data.get("agent_teams", False)
+        return model, agent_teams
+
     # ── Event handlers ──
+
+    def _on_remote_control_toggle(self, *_a):
+        self.config_data["remote_control"] = self.remote_control.get()
+        save_config(self.config_data)
 
     def _on_autostart_toggle(self, *_a):
         self.config_data["auto_start"] = self.auto_start.get()
@@ -1179,8 +2076,10 @@ class SessionLauncher(tk.Tk):
             if sel[0] < len(filtered):
                 proj = filtered[sel[0]]
                 flags = self.config_data.get("custom_flags", {}).get(proj['encoded_name'], "")
+                mdl, teams = self._resolve_launch_opts(proj['encoded_name'])
                 launch_session(proj['decoded_path'], self.skip_perms.get(), self.mode.get(),
-                               extra_flags=flags)
+                               extra_flags=flags, remote_control=self.remote_control.get(),
+                               model=mdl, agent_teams=teams)
                 self._record_launch(proj['encoded_name'])
                 self._flash_card(proj['encoded_name'])
             palette.destroy()
@@ -1463,7 +2362,10 @@ class SessionLauncher(tk.Tk):
         for i, (key, proj, session_id, flags) in enumerate(to_launch):
             delay = i * 2000 if len(to_launch) >= 3 else 0
             def _do(p=proj, s=session_id, f=flags, k=key):
-                launch_session(p['decoded_path'], skip, mode, s, extra_flags=f)
+                mdl, teams = self._resolve_launch_opts(k)
+                launch_session(p['decoded_path'], skip, mode, s, extra_flags=f,
+                               remote_control=self.remote_control.get(),
+                               model=mdl, agent_teams=teams)
                 self._record_launch(k)
                 self._flash_card(k)
             if delay:
@@ -1640,7 +2542,9 @@ class SessionLauncher(tk.Tk):
         def _dbl(e, p=proj):
             if path_exists:
                 flags = self.config_data.get("custom_flags", {}).get(p['encoded_name'], "")
-                launch_session(p['decoded_path'], self.skip_perms.get(), self.mode.get(), extra_flags=flags)
+                mdl, teams = self._resolve_launch_opts(p['encoded_name'])
+                launch_session(p['decoded_path'], self.skip_perms.get(), self.mode.get(), extra_flags=flags,
+                               remote_control=self.remote_control.get(), model=mdl, agent_teams=teams)
                 self._record_launch(p['encoded_name'])
                 self._flash_card(p['encoded_name'])
         card.bind("<Double-Button-1>", _dbl)
@@ -1839,7 +2743,9 @@ class SessionLauncher(tk.Tk):
                 idx = d.current() if d.current() >= 0 else 0
                 sid = sids[idx]
             flags = self.config_data.get("custom_flags", {}).get(p['encoded_name'], "")
-            launch_session(p['decoded_path'], self.skip_perms.get(), mode, sid, extra_flags=flags)
+            mdl, teams = self._resolve_launch_opts(p['encoded_name'])
+            launch_session(p['decoded_path'], self.skip_perms.get(), mode, sid, extra_flags=flags,
+                          remote_control=self.remote_control.get(), model=mdl, agent_teams=teams)
             self._record_launch(p['encoded_name'])
             self._flash_card(p['encoded_name'])
 
