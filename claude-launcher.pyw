@@ -468,7 +468,11 @@ class SessionLauncher(ctk.CTk):
         self.minsize(700, 460)
         self.configure(fg_color=BG)
         try:
-            self.iconbitmap(default='')
+            _icon_path = Path(__file__).parent / "claude-icon.ico"
+            if _icon_path.exists():
+                self.iconbitmap(str(_icon_path))
+            else:
+                self.iconbitmap(default='')
         except Exception:
             pass
 
@@ -846,7 +850,15 @@ class SessionLauncher(ctk.CTk):
                     if not hwnd:
                         return
                     self._tray_hwnd = hwnd
-                    icon = user32.LoadIconW(0, 32512)
+                    # Load custom Claude icon for tray
+                    _tray_ico = str(Path(__file__).parent / "claude-icon.ico")
+                    IMAGE_ICON = 1
+                    LR_LOADFROMFILE = 0x0010
+                    LR_DEFAULTSIZE = 0x0040
+                    icon = user32.LoadImageW(0, _tray_ico, IMAGE_ICON, 0, 0,
+                                             LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                    if not icon:
+                        icon = user32.LoadIconW(0, 32512)
                     nid = NOTIFYICONDATAW()
                     nid.cbSize = sizeof(NOTIFYICONDATAW)
                     nid.hWnd = hwnd
